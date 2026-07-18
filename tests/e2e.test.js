@@ -411,7 +411,7 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
       assert.ok(info.exchange, 'Has exchange');
     });
 
-    it('symbol_search — search dialog scraping', async () => {
+    it('symbol_search — search dialog scraping', async (t) => {
       // Open symbol search
       await evaluate(`
         (function() {
@@ -420,32 +420,54 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
           if (btn) btn.click();
         })()
       `);
-      await sleep(500);
 
-      // Type search query
-      await Input.insertText({ text: 'AAPL' });
-      await sleep(800);
+      try {
+        // insertText types into whatever holds focus — if the dialog fails to
+        // open, that can be the Pine editor's Monaco buffer. Confirm the
+        // symbol-search input owns focus before typing anything.
+        let focused = false;
+        for (let i = 0; i < 10 && !focused; i++) {
+          await sleep(200);
+          focused = await evaluate(`
+            (function() {
+              var ae = document.activeElement;
+              if (!ae || (ae.tagName !== 'INPUT' && ae.tagName !== 'TEXTAREA')) return false;
+              if (ae.closest('.monaco-editor')) return false;
+              return !!(ae.matches('[data-role="search"]')
+                || ae.closest('[data-name="symbol-search-items-dialog"], [data-dialog-name*="symbol"], [class*="symbolSearch"]'));
+            })()
+          `);
+        }
+        if (!focused) {
+          t.skip('Symbol search dialog did not take focus — skipping instead of typing blind');
+          return;
+        }
 
-      // Read results
-      const results = await evaluate(`
-        (function() {
-          var rows = document.querySelectorAll('[data-role="list-item"], .symbolRow-pnIJWxyD, .listRow, [class*="listRow"]');
-          var out = [];
-          for (var i = 0; i < Math.min(rows.length, 5); i++) {
-            var symbolEl = rows[i].querySelector('[class*="symbolNameText"], [class*="bold"], .highlight-GZaJnFcP')
-                        || rows[i].querySelector('span:first-child');
-            if (symbolEl) out.push(symbolEl.textContent.trim());
-          }
-          return out;
-        })()
-      `);
+        // Type search query
+        await Input.insertText({ text: 'AAPL' });
+        await sleep(800);
 
-      // Close dialog
-      await Input.dispatchKeyEvent({ type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
-      await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Escape', code: 'Escape' });
+        // Read results
+        const results = await evaluate(`
+          (function() {
+            var rows = document.querySelectorAll('[data-role="list-item"], .symbolRow-pnIJWxyD, .listRow, [class*="listRow"]');
+            var out = [];
+            for (var i = 0; i < Math.min(rows.length, 5); i++) {
+              var symbolEl = rows[i].querySelector('[class*="symbolNameText"], [class*="bold"], .highlight-GZaJnFcP')
+                          || rows[i].querySelector('span:first-child');
+              if (symbolEl) out.push(symbolEl.textContent.trim());
+            }
+            return out;
+          })()
+        `);
 
-      assert.ok(Array.isArray(results), 'Results array returned');
-      // Results may or may not appear depending on dialog state
+        assert.ok(Array.isArray(results), 'Results array returned');
+        // Results may or may not appear depending on dialog state
+      } finally {
+        // Always close the dialog so a failure can't leave it open
+        await Input.dispatchKeyEvent({ type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+        await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Escape', code: 'Escape' });
+      }
     });
   });
 
