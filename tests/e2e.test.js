@@ -22,7 +22,16 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import CDP from 'chrome-remote-interface';
+// The Pine Script section drives the real implementations end-to-end (they
+// hold their own CDP connection via src/connection.js — closed in the final
+// file-level after() sweep).
+import * as pineCore from '../src/core/pine.js';
 import { buildExitReplayJS } from '../src/core/replay.js';
+import {
+  disconnect as disconnectPineCore,
+  getClient as getPineCoreClient,
+  evaluate as coreEvaluate,
+} from '../src/connection.js';
 
 let client;
 let Runtime;
@@ -66,6 +75,83 @@ function wv(path) {
 /** Sleep for ms */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// ── Pine editor capture/restore (see the Pine Script section) ────────────
+// The state the user's live editor is in when the run starts, captured in the
+// Pine section's before() and restored both there (early, in case a later
+// suite kills the process) and in the file-level final after() (late, so raw
+// key/mouse events dispatched by later suites can't leave typed garbage in
+// the focused Monaco buffer — that happened on the first run of this suite).
+// These use the core connection (src/connection.js), NOT the test's CDP
+// client, so they still work after the test client is closed.
+
+let pineOriginal = null;      // { script_id, script_name, source } the user had open
+let pineEditorWasOpen = false;
+
+async function corePressEscape() {
+  const c = await getPineCoreClient();
+  await c.Input.dispatchKeyEvent({ type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+  await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Escape', code: 'Escape' });
+}
+
+// Best-effort modal sweep (unsaved-changes / save-name dialogs) so a failed
+// test can't leave the live session wedged behind a dialog.
+async function coreDismissDialogs() {
+  for (let i = 0; i < 3; i++) {
+    const open = await coreEvaluate(`!!document.querySelector('[role="dialog"]')`).catch(() => false);
+    if (!open) return;
+    await corePressEscape();
+    await sleep(400);
+  }
+}
+
+// Monaco can lag the editor store after a facade openScript, so a single read
+// may see a half-loaded buffer. Read until two consecutive reads agree —
+// diffing or writing against an unstable buffer is how content gets mangled.
+async function readEditorStable() {
+  let prev = null;
+  for (let i = 0; i < 10; i++) {
+    const cur = await pineCore.getSource().catch(() => null);
+    if (cur && prev && cur.script_id === prev.script_id && cur.source === prev.source) return cur;
+    prev = cur;
+    await sleep(400);
+  }
+  return prev;
+}
+
+// Put the editor back exactly as captured: same script open, same buffer
+// content (including unsaved edits). Idempotent; verifies identity before
+// every write so it can never write into the wrong script.
+async function restorePineEditor() {
+  if (!pineOriginal) return;
+  try {
+    await coreDismissDialogs();
+    const cur = await readEditorStable();
+    const moved = !cur || cur.script_id !== pineOriginal.script_id || cur.source !== pineOriginal.source;
+    if (!moved) return;
+    if (pineOriginal.script_id && pineOriginal.script_name) {
+      const back = await pineCore.openScript({ name: pineOriginal.script_name });
+      if (back.script_id !== pineOriginal.script_id) {
+        console.error(`Pine e2e restore: "${pineOriginal.script_name}" resolved to ${back.script_id}, `
+          + `expected ${pineOriginal.script_id} (duplicate script names?) — left as-is, reopen manually.`);
+        return;
+      }
+      // openScript reloads the saved content; re-apply any unsaved edits the
+      // user had, as unsaved edits, exactly as captured.
+      const reloaded = await readEditorStable();
+      if (reloaded && reloaded.script_id === pineOriginal.script_id && reloaded.source !== pineOriginal.source) {
+        await pineCore.setSource({ source: pineOriginal.source });
+      }
+    } else if (typeof pineOriginal.source === 'string') {
+      // The user had an unsaved draft open; drafts are ephemeral, so put the
+      // captured content back into a fresh draft.
+      await pineCore.newScript({ type: 'indicator' });
+      await pineCore.setSource({ source: pineOriginal.source });
+    }
+  } catch (err) {
+    console.error('Pine e2e restore failed — check the Pine Editor manually:', err.message);
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('TradingView MCP — Full E2E (70 tools)', () => {
@@ -86,6 +172,18 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
     } catch (err) {
       console.error('Cannot connect to TradingView. Make sure it is running with --remote-debugging-port=9222');
       process.exit(1);
+    }
+
+    // Capture the Pine editor state FIRST — suites before the Pine section
+    // dispatch raw typing/clicks (e.g. the symbol-search test's insertText)
+    // that can land in the focused Monaco buffer, so the restore baseline
+    // must predate EVERY suite, not just the Pine section.
+    try {
+      pineEditorWasOpen = await evaluate(`!!document.querySelector('.monaco-editor.pine-editor-monaco')`);
+      const res = await pineCore.getSource();
+      pineOriginal = { script_id: res.script_id, script_name: res.script_name, source: res.source };
+    } catch {
+      pineOriginal = null; // editor unreachable — Pine write-path tests skip
     }
   });
 
@@ -664,266 +762,184 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
   // ─── 4. PINE SCRIPT (12 tools) ────────────────────────────────────────
 
   describe('Pine Script', () => {
-    let editorWasOpen = false;
+    // The write-path tests here burned us on 2026-07-18: the old inline tests
+    // wrote a snippet into WHATEVER script the live editor had open and
+    // Ctrl+S'd it over the user's saved script (recovered only via
+    // TradingView's version history). This section now drives the real
+    // implementations in src/core/pine.js end-to-end under three rules:
+    //   1. The open script's identity + source are captured before any test
+    //      and restored — including unsaved edits — in this suite's after()
+    //      AND in the file-level final after() (later suites dispatch raw
+    //      key/mouse events that can type into the focused Monaco buffer), so
+    //      even a failed run leaves the editor as it was found.
+    //   2. Writes and saves happen only on a scratch target (an untitled
+    //      draft or the saved MCP_E2E_SCRATCH script) after the switch away
+    //      from the user's script has been verified; write tests skip rather
+    //      than run unguarded.
+    //   3. Compile checks use paths that need no save at all (server-side
+    //      pine_check, Monaco markers); nothing here clicks "Add to chart".
+
+    const SCRATCH_NAME = 'MCP_E2E_SCRATCH';
+    const SCRATCH_SOURCE = `//@version=6\nindicator("${SCRATCH_NAME}", overlay=true)\nplot(close)\n`;
+
+    let scratchRecord = null; // saved MCP_E2E_SCRATCH from pine_list_scripts, if any
+    let onScratch = false;    // editor verified on a scratch target — writes allowed
 
     before(async () => {
-      // Check if editor is already open
-      editorWasOpen = await evaluate(`!!document.querySelector('.monaco-editor.pine-editor-monaco')`);
+      await coreDismissDialogs(); // a previously killed run may have left one open
+      // The capture baseline is taken in the file-level before() (it must
+      // predate every suite's raw input events); this is only a fallback for
+      // runs where that capture failed or was filtered out.
+      if (!pineOriginal) {
+        try {
+          const res = await pineCore.getSource();
+          pineOriginal = { script_id: res.script_id, script_name: res.script_name, source: res.source };
+        } catch {
+          pineOriginal = null; // editor unreachable — every write-path test skips
+        }
+      }
     });
 
     after(async () => {
-      // Restore editor state
-      if (!editorWasOpen) {
-        await evaluate(`try { ${CLOSE_BOTTOM('pine-editor')} } catch(e) {}`);
-        await sleep(300);
-      }
+      // Early restore — if a later suite kills the process, the editor is
+      // already back. The file-level final after() re-verifies once every
+      // suite has run.
+      await restorePineEditor();
     });
 
-    async function ensureEditor() {
-      const already = await evaluate(`!!document.querySelector('.monaco-editor.pine-editor-monaco')`);
-      if (already) return true;
-      await evaluate(`
-        (function() {
-          var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
-          if (bwb && typeof bwb.activateScriptEditorTab === 'function') bwb.activateScriptEditorTab();
-          else if (bwb && typeof bwb.showWidget === 'function') bwb.showWidget('pine-editor');
-        })()
-      `);
-      for (let i = 0; i < 50; i++) {
-        await sleep(200);
-        const ready = await evaluate(`!!document.querySelector('.monaco-editor.pine-editor-monaco')`);
-        if (ready) return true;
-      }
-      return false;
-    }
-
-    const FIND_MONACO = `
-      (function findMonacoEditor() {
-        var container = document.querySelector('.monaco-editor.pine-editor-monaco');
-        if (!container) return null;
-        var el = container;
-        var fiberKey;
-        for (var i = 0; i < 20; i++) {
-          if (!el) break;
-          fiberKey = Object.keys(el).find(function(k) { return k.startsWith('__reactFiber$'); });
-          if (fiberKey) break;
-          el = el.parentElement;
-        }
-        if (!fiberKey) return null;
-        var current = el[fiberKey];
-        for (var d = 0; d < 15; d++) {
-          if (!current) break;
-          if (current.memoizedProps && current.memoizedProps.value && current.memoizedProps.value.monacoEnv) {
-            var env = current.memoizedProps.value.monacoEnv;
-            if (env.editor && typeof env.editor.getEditors === 'function') {
-              var editors = env.editor.getEditors();
-              if (editors.length > 0) return { editor: editors[0], env: env };
-            }
-          }
-          current = current.return;
-        }
-        return null;
-      })()
-    `;
-
-    it('pine_get_source — read editor code', async () => {
-      const ready = await ensureEditor();
-      if (!ready) return; // Skip if editor can't be opened
-      const source = await evaluate(`
-        (function() {
-          var m = ${FIND_MONACO};
-          if (!m) return null;
-          return m.editor.getValue();
-        })()
-      `);
-      // Source might be null if Monaco fiber path changed
-      if (source !== null) {
-        assert.ok(typeof source === 'string', 'Source is string');
-      }
+    it('pine_get_source — read code + script identity', async (t) => {
+      if (!pineOriginal) return t.skip('Pine editor unreachable');
+      const res = await pineCore.getSource();
+      assert.equal(res.success, true);
+      assert.equal(typeof res.source, 'string', 'source is a string');
+      assert.ok(res.line_count >= 1, 'line_count present');
+      assert.ok('script_id' in res && 'script_name' in res, 'script identity fields present');
     });
 
-    it('pine_set_source — inject code', async () => {
-      const ready = await ensureEditor();
-      if (!ready) return;
-      const testCode = '//@version=6\nindicator("E2E Test", overlay=true)\nplot(close)';
-      const set = await evaluate(`
-        (function() {
-          var m = ${FIND_MONACO};
-          if (!m) return false;
-          m.editor.setValue(${JSON.stringify(testCode)});
-          return true;
-        })()
-      `);
-      if (set) {
-        const readBack = await evaluate(`
-          (function() { var m = ${FIND_MONACO}; return m ? m.editor.getValue() : null; })()
-        `);
-        assert.ok(readBack && readBack.includes('E2E Test'), 'Source was set');
-      }
+    it('pine_list_scripts — saved scripts via pine-facade', async () => {
+      const res = await pineCore.listScripts();
+      assert.equal(res.success, true);
+      assert.ok(Array.isArray(res.scripts), 'scripts is an array');
+      scratchRecord = res.scripts.find(s => s.name === SCRATCH_NAME || s.title === SCRATCH_NAME) || null;
     });
 
-    it('pine_compile — add to chart button', async () => {
-      const ready = await ensureEditor();
-      if (!ready) return;
-      // Just verify we can find compile buttons
+    it('pine_analyze — offline static analysis', () => {
+      const res = pineCore.analyze({
+        source: '//@version=6\nindicator("Test")\na = array.from(1, 2, 3)\nval = array.get(a, 5)',
+      });
+      assert.equal(res.success, true);
+      assert.equal(res.issue_count, 1, 'detected 1 OOB error');
+      assert.ok(res.diagnostics[0].message.includes('5'), 'found index 5');
+    });
+
+    it('pine_check — server-side compile, no editor, no save', async () => {
+      const res = await pineCore.check({ source: SCRATCH_SOURCE });
+      assert.equal(res.success, true);
+      assert.equal(res.compiled, true, `scratch source must compile: ${JSON.stringify(res.errors)}`);
+    });
+
+    it('pine_check — reports errors for bad source', async () => {
+      const res = await pineCore.check({ source: '//@version=6\nindicator("Bad")\nplot(close' });
+      assert.equal(res.success, true);
+      assert.equal(res.compiled, false, 'bad source must not compile');
+      assert.ok(res.error_count >= 1, 'at least one error reported');
+    });
+
+    // ── Write path — every test below runs on a scratch target only. ──
+
+    it('pine_new — create untitled draft via the editor facade', async (t) => {
+      if (!pineOriginal) return t.skip('Pine editor unreachable — refusing all write-path tests');
+      const res = await pineCore.newScript({ type: 'indicator' });
+      assert.equal(res.success, true);
+      assert.equal(res.verified, true, 'facade-created draft must be verified');
+      assert.equal(res.action, 'new_script_created');
+      // The editor is now on an ephemeral draft — the user's script is no
+      // longer the write target for anything below.
+      onScratch = true;
+    });
+
+    it(`pine_open — open saved ${SCRATCH_NAME} (skipped until pine_save first creates it)`, async (t) => {
+      if (!onScratch) return t.skip('draft switch failed — staying off the write path');
+      if (!scratchRecord) return t.skip(`no saved ${SCRATCH_NAME} yet — pine_save creates it this run`);
+      const res = await pineCore.openScript({ name: SCRATCH_NAME });
+      assert.equal(res.success, true);
+      assert.equal(res.verified, true, 'switch must be store-verified');
+      assert.equal(res.script_id, scratchRecord.id, 'editor landed on the scratch script');
+    });
+
+    it('pine_set_source — guarded write into the scratch target', async (t) => {
+      if (!onScratch) return t.skip('no verified scratch target — refusing to write');
+      const res = await pineCore.setSource({ source: SCRATCH_SOURCE });
+      assert.equal(res.success, true);
+      assert.equal(res.verified_against_target, true, 'write must be verified against the pine_new/pine_open target');
+      const back = await pineCore.getSource();
+      assert.ok(back.source.includes(SCRATCH_NAME), 'scratch source is in the editor');
+    });
+
+    it('pine_get_errors — Monaco markers', async (t) => {
+      if (!pineOriginal) return t.skip('Pine editor unreachable');
+      const res = await pineCore.getErrors();
+      assert.equal(res.success, true);
+      assert.ok(Array.isArray(res.errors), 'errors array returned');
+    });
+
+    it('pine_get_console — console entries readable', async (t) => {
+      if (!pineOriginal) return t.skip('Pine editor unreachable');
+      const res = await pineCore.getConsole();
+      assert.equal(res.success, true);
+      assert.ok(res.entry_count >= 0, 'entry count returned');
+    });
+
+    it('pine_compile / pine_smart_compile — buttons findable (scan only, no click)', async (t) => {
+      if (!pineOriginal) return t.skip('Pine editor unreachable');
+      // Clicking "Add to chart" would mutate the user's chart layout, so the
+      // e2e only verifies the buttons those tools click are findable.
       const buttons = await evaluate(`
         (function() {
           var btns = document.querySelectorAll('button');
           var found = [];
           for (var i = 0; i < btns.length; i++) {
             var text = btns[i].textContent.trim();
-            if (/add to chart|update on chart|save and add/i.test(text)) {
-              found.push(text);
-            }
+            if (/add to chart|update on chart|save and add/i.test(text)) found.push(text);
           }
           return found;
         })()
       `);
-      assert.ok(Array.isArray(buttons), 'Button scan works');
+      assert.ok(Array.isArray(buttons), 'button scan works');
     });
 
-    it('pine_smart_compile — detect button + check errors', async () => {
-      // Same as pine_compile but also checks Monaco markers
-      const ready = await ensureEditor();
-      if (!ready) return;
-      const markers = await evaluate(`
-        (function() {
-          var m = ${FIND_MONACO};
-          if (!m) return [];
-          var model = m.editor.getModel();
-          if (!model) return [];
-          return m.env.editor.getModelMarkers({ resource: model.uri }).length;
-        })()
-      `);
-      assert.ok(typeof markers === 'number', 'Marker count returned');
-    });
-
-    it('pine_get_errors — Monaco markers', async () => {
-      const ready = await ensureEditor();
-      if (!ready) return;
-      const errors = await evaluate(`
-        (function() {
-          var m = ${FIND_MONACO};
-          if (!m) return [];
-          var model = m.editor.getModel();
-          if (!model) return [];
-          return m.env.editor.getModelMarkers({ resource: model.uri }).map(function(mk) {
-            return { line: mk.startLineNumber, message: mk.message, severity: mk.severity };
-          });
-        })()
-      `);
-      assert.ok(Array.isArray(errors), 'Errors array returned');
-    });
-
-    it('pine_get_console — log output', async () => {
-      const ready = await ensureEditor();
-      if (!ready) return;
-      const entries = await evaluate(`
-        (function() {
-          var rows = document.querySelectorAll('[class*="consoleRow"], [class*="log-"], [class*="consoleLine"]');
-          return rows.length;
-        })()
-      `);
-      assert.ok(typeof entries === 'number', 'Console row count returned');
-    });
-
-    it('pine_save — Ctrl+S dispatch', async () => {
-      const ready = await ensureEditor();
-      if (!ready) return;
-      // Just verify key dispatch doesn't throw
-      await Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 's', code: 'KeyS', windowsVirtualKeyCode: 83 });
-      await Input.dispatchKeyEvent({ type: 'keyUp', key: 's', code: 'KeyS' });
-      await sleep(300);
-    });
-
-    it('pine_new — find "New" menu items', async () => {
-      const ready = await ensureEditor();
-      if (!ready) return;
-      // We just test that the Pine toolbar buttons are findable
-      const hasPineToolbar = await evaluate(`
-        !!(document.querySelector('[class*="pine-editor"] [class*="toolbar"]')
-          || document.querySelector('[class*="editorToolbar"]')
-          || document.querySelector('[class*="layout__area--bottom"] [class*="toolbar"]'))
-      `);
-      assert.ok(typeof hasPineToolbar === 'boolean', 'Pine toolbar detection works');
-    });
-
-    it('pine_open — script dropdown access', async () => {
-      // Same as pine_new — tests toolbar button access
-      const ready = await ensureEditor();
-      if (!ready) return;
-      const bottomArea = await evaluate(`!!document.querySelector('[class*="layout__area--bottom"]')`);
-      assert.ok(bottomArea, 'Bottom area exists for script dropdown');
-    });
-
-    it('pine_list_scripts — scrape dropdown items', async () => {
-      // Tests the same path as pine_open — dropdown scraping
-      const ready = await ensureEditor();
-      if (!ready) return;
-      // Just verify we can find the bottom area buttons
-      const btnCount = await evaluate(`
-        (function() {
-          var area = document.querySelector('[class*="layout__area--bottom"]');
-          return area ? area.querySelectorAll('button').length : 0;
-        })()
-      `);
-      assert.ok(btnCount >= 0, 'Button count retrieved');
-    });
-
-    it('pine_analyze — offline static analysis', async () => {
-      // This runs offline, no TradingView needed
-      // Test imported from pine_analyze.test.js pattern
-      const source = `//@version=6
-indicator("Test")
-a = array.from(1, 2, 3)
-val = array.get(a, 5)`;
-
-      // Inline the analysis logic (same as the tool)
-      const lines = source.split('\n');
-      const arrays = new Map();
-      const diagnostics = [];
-
-      for (let i = 0; i < lines.length; i++) {
-        const fromMatch = lines[i].match(/(\w+)\s*=\s*array\.from\(([^)]*)\)/);
-        if (fromMatch) {
-          const name = fromMatch[1].trim();
-          const args = fromMatch[2].trim();
-          arrays.set(name, { name, size: args === '' ? 0 : args.split(',').length, line: i + 1 });
-        }
-      }
-      for (let i = 0; i < lines.length; i++) {
-        const pattern = /array\.(get|set)\(\s*(\w+)\s*,\s*(-?\d+)/g;
-        let match;
-        while ((match = pattern.exec(lines[i])) !== null) {
-          const info = arrays.get(match[2]);
-          if (info && info.size !== null) {
-            const idx = parseInt(match[3], 10);
-            if (idx < 0 || idx >= info.size) {
-              diagnostics.push({ line: i + 1, message: `OOB index ${idx}`, severity: 'error' });
-            }
-          }
-        }
-      }
-      assert.equal(diagnostics.length, 1, 'Detected 1 OOB error');
-      assert.ok(diagnostics[0].message.includes('5'), 'Found index 5');
-    });
-
-    it('pine_check — server-side compile via TradingView API', async () => {
-      const source = `//@version=6\nindicator("API Test", overlay=true)\nplot(close)`;
-      const formData = new URLSearchParams();
-      formData.append('source', source);
-
-      const response = await fetch(
-        'https://pine-facade.tradingview.com/pine-facade/translate_light?user_name=Guest&pine_id=00000000-0000-0000-0000-000000000000',
-        {
-          method: 'POST',
-          headers: { 'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': 'https://www.tradingview.com/' },
-          body: formData,
-        }
+    it('pine_save — save the scratch target (never the user script)', async (t) => {
+      if (!onScratch) return t.skip('no verified scratch target — refusing to save');
+      // Re-verify the editor immediately before Ctrl+S: it must hold the
+      // scratch source AND be an untitled draft or the saved scratch script.
+      const cur = await pineCore.getSource();
+      assert.ok(cur.source.includes(SCRATCH_NAME), 'editor must hold the scratch source before saving');
+      assert.ok(
+        cur.script_id === null || (scratchRecord && cur.script_id === scratchRecord.id),
+        `refusing to save: editor is on "${cur.script_name}" (${cur.script_id}), not a scratch target`
       );
-      assert.ok(response.ok, `API returned ${response.status}`);
-      const result = await response.json();
-      assert.ok(result.result || result.error === undefined, 'Compiles successfully');
+
+      const res = await pineCore.save();
+      assert.equal(res.success, true);
+      await coreDismissDialogs(); // never leave a save dialog open on the live session
+
+      // The save must have landed on the scratch script, not the user's.
+      let saved = null;
+      for (let i = 0; i < 10; i++) {
+        saved = await pineCore.getSource().catch(() => null);
+        if (saved?.script_id) break;
+        await sleep(500);
+      }
+      assert.ok(saved?.script_id, 'scratch is a saved script after pine_save');
+      if (pineOriginal.script_id && saved.script_id === pineOriginal.script_id) {
+        assert.ok(scratchRecord && pineOriginal.script_id === scratchRecord.id,
+          'save must never land on the script the user had open');
+      }
+      const list = await pineCore.listScripts();
+      assert.ok(
+        list.scripts.some(s => s.name === SCRATCH_NAME || s.title === SCRATCH_NAME),
+        `${SCRATCH_NAME} exists in the saved scripts list after save`
+      );
     });
   });
 
@@ -1603,5 +1619,22 @@ val = array.get(a, 5)`;
       }, null, 2);
       assert.ok(response.length < 500, `Screenshot response is ${response.length} bytes (< 500)`);
     });
+  });
+
+  // ── Final sweep — leave the live session as the run found it ──────────
+  // Registered last so it runs after every suite (and after the test CDP
+  // client is closed) — it uses only the core connection. Later suites
+  // dispatch raw key/mouse events that can land in the focused Pine editor,
+  // so the Pine restore is re-verified here at the very end of the run.
+  after(async () => {
+    try {
+      await restorePineEditor();
+      if (pineOriginal && !pineEditorWasOpen) {
+        await coreEvaluate(`try { ${CLOSE_BOTTOM('pine-editor')} } catch(e) {}`).catch(() => {});
+        await sleep(300);
+      }
+    } finally {
+      await disconnectPineCore().catch(() => {});
+    }
   });
 });
