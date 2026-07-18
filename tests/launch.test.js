@@ -29,7 +29,7 @@ function mockChild({ failWith } = {}) {
  *   cdpBindsFor  — spawn paths (substring) after which probeCdp starts succeeding
  *   copyExists   — local copy already present
  */
-function msixDeps({ spawnFailures = [], cdpBindsFor = [], copyExists = false } = {}) {
+function msixDeps({ spawnFailures = [], cdpBindsFor = [], copyExists = false, regFails = false } = {}) {
   const state = { spawned: [], copies: [], removed: [], killed: 0, cdpUp: false };
   const deps = {
     existsSync: (p) => {
@@ -38,6 +38,16 @@ function msixDeps({ spawnFailures = [], cdpBindsFor = [], copyExists = false } =
       return false;
     },
     execSync: (cmd) => {
+      // Simulate a machine whose registry layout differs — forces Get-AppxPackage fallback.
+      if (regFails && cmd.includes('reg query')) throw new Error('registry key not found');
+      // Fast registry detection path (primary).
+      if (cmd.includes('reg query') && cmd.includes('/k')) {
+        return 'HKEY_CURRENT_USER\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages\\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\n';
+      }
+      if (cmd.includes('reg query') && cmd.includes('PackageRootFolder')) {
+        return 'HKEY_CURRENT_USER\\...\\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\n    PackageRootFolder    REG_SZ    C:\\Program Files\\WindowsApps\\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\n';
+      }
+      // Slow Get-AppxPackage fallback (kept for setups where the registry layout differs).
       if (cmd.includes('Get-AppxPackage')) {
         return 'C:\\Program Files\\WindowsApps\\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\n';
       }
@@ -113,6 +123,13 @@ describe('launch() — MSIX WindowsApps handling', { skip: !onWindows }, () => {
     assert.equal(result.cdp_ready, false);
     assert.equal(result.msix_local_copy, true);
     assert.ok(result.warning);
+  });
+
+  it('falls back to Get-AppxPackage when the registry lookup fails', async () => {
+    const { deps } = msixDeps({ regFails: true, cdpBindsFor: ['WindowsApps'] });
+    const result = await launch({ _deps: deps });
+    assert.equal(result.success, true);
+    assert.equal(result.binary, MSIX_EXE);
   });
 });
 

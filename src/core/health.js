@@ -201,6 +201,37 @@ export async function uiState() {
 
 const WINDOWS_APPS_RE = /\\WindowsApps\\/i;
 
+// Per-user registry index of installed MSIX packages. Each immediate subkey is a
+// PackageFullName; its PackageRootFolder value is the InstallLocation. Reading this
+// is ~300ms vs ~5-8s for `Get-AppxPackage` (whose Appx-module load routinely blew
+// past the old 5s timeout, so MSIX detection silently failed — issue: NQ chart PC).
+const MSIX_PACKAGES_KEY =
+  'HKCU\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages';
+
+/**
+ * Resolve the TradingView MSIX InstallLocation on Windows without elevation.
+ * Fast path: query the per-user package registry index. Fallback: Get-AppxPackage
+ * with a generous timeout for setups where the registry layout differs (provisioned
+ * / all-users installs). Returns the install directory string, or null.
+ */
+function _findMsixInstallDir({ execSync: exec }) {
+  try {
+    const found = exec(`reg query "${MSIX_PACKAGES_KEY}" /f "TradingView.Desktop_*" /k`, { timeout: 8000 }).toString();
+    const keyLine = found.split(/\r?\n/).map((l) => l.trim()).find((l) => /\\TradingView\.Desktop_/i.test(l));
+    if (keyLine) {
+      const valOut = exec(`reg query "${keyLine}" /v PackageRootFolder`, { timeout: 8000 }).toString();
+      const m = valOut.match(/PackageRootFolder\s+REG_SZ\s+(.+?)\s*$/im);
+      if (m && m[1].trim()) return m[1].trim();
+    }
+  } catch { /* fall through to Get-AppxPackage */ }
+  try {
+    const ps = "powershell -NoProfile -Command \"(Get-AppxPackage -Name 'TradingView.Desktop' -ErrorAction SilentlyContinue).InstallLocation\"";
+    const installDir = exec(ps, { timeout: 15000 }).toString().trim();
+    if (installDir) return installDir;
+  } catch { /* ignore */ }
+  return null;
+}
+
 function _resolveLaunchDeps(deps) {
   return {
     spawn: deps?.spawn || spawn,
@@ -315,16 +346,14 @@ export async function launch({ port, kill_existing, _deps } = {}) {
   }
 
   if (!tvPath && platform === 'win32') {
-    // MSIX/Windows Store install — InstallLocation is in WindowsApps, which is ACL-restricted
-    // for normal `dir` enumeration but readable via Get-AppxPackage without elevation.
-    try {
-      const ps = 'powershell -NoProfile -Command "(Get-AppxPackage -Name \'TradingView.Desktop\' -ErrorAction SilentlyContinue).InstallLocation"';
-      const installDir = deps.execSync(ps, { timeout: 5000 }).toString().trim();
-      if (installDir) {
-        const candidate = `${installDir}\\TradingView.exe`;
-        if (deps.existsSync(candidate)) tvPath = candidate;
-      }
-    } catch { /* ignore */ }
+    // MSIX/Windows Store install — InstallLocation is in WindowsApps, which is
+    // ACL-restricted for `dir` enumeration but resolvable via the registry (fast)
+    // or Get-AppxPackage (slow fallback). See _findMsixInstallDir.
+    const installDir = _findMsixInstallDir(deps);
+    if (installDir) {
+      const candidate = `${installDir}\\TradingView.exe`;
+      if (deps.existsSync(candidate)) tvPath = candidate;
+    }
   }
 
   if (!tvPath) {
