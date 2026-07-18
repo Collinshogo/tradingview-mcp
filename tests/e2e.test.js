@@ -360,8 +360,10 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
     });
 
     it('chart_set_visible_range — zoom via bar indices', async () => {
-      const rangeBefore = await evaluate(`${CHART_API}.getVisibleRange()`);
-      await evaluate(`
+      // Zoom to the last 21 bars and return that window's timestamps, so the
+      // assertion is against the requested window — not the pre-zoom view,
+      // which depends on what earlier tests left on screen.
+      const target = await evaluate(`
         (function() {
           var m = ${CHART_API}._chartWidget.model();
           var ts = m.timeScale();
@@ -369,11 +371,19 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
           var endIdx = bars.lastIndex();
           var startIdx = Math.max(bars.firstIndex(), endIdx - 20);
           ts.zoomToBarsRange(startIdx, endIdx);
+          var first = bars.valueAt(startIdx);
+          var last = bars.valueAt(endIdx);
+          return (first && last) ? { from: first[0], to: last[0] } : null;
         })()
       `);
+      assert.ok(target && target.from && target.to, 'Target bar times resolved');
       await sleep(500);
       const rangeAfter = await evaluate(`${CHART_API}.getVisibleRange()`);
-      assert.ok(rangeAfter.from >= rangeBefore.from, 'Range changed');
+      const span = target.to - target.from;
+      const slack = span * 0.25;
+      assert.ok(rangeAfter.from <= target.from + slack, 'Visible range starts at requested window');
+      assert.ok(rangeAfter.to >= target.to - slack, 'Visible range reaches last requested bar');
+      assert.ok(rangeAfter.to - rangeAfter.from <= span * 3 + slack, 'Visible range zoomed to ~requested width');
     });
 
     it('chart_scroll_to_date — jump to date', async () => {
