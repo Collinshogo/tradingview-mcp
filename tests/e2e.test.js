@@ -26,7 +26,7 @@ import CDP from 'chrome-remote-interface';
 // hold their own CDP connection via src/connection.js — closed in the final
 // file-level after() sweep).
 import * as pineCore from '../src/core/pine.js';
-import { buildExitReplayJS } from '../src/core/replay.js';
+import { buildExitReplayJS, buildVerifyExitJS } from '../src/core/replay.js';
 import {
   disconnect as disconnectPineCore,
   getClient as getPineCoreClient,
@@ -1217,16 +1217,21 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
     });
 
     after(async () => {
-      // Ensure replay is stopped
+      // Ensure replay is stopped — and make a failed cleanup VISIBLE instead of
+      // silently leaving the live session in replay.
       try {
         await evaluate(buildExitReplayJS(REPLAY_API));
         await sleep(500);
+        const st = await evaluate(buildVerifyExitJS(REPLAY_API));
+        if (st && (st.started || st.mode_enabled || st.in_replay)) {
+          console.error('Replay cleanup incomplete after e2e block:', JSON.stringify(st));
+        }
       } catch {}
     });
 
-    it('replay_start — enter replay mode', async () => {
+    it('replay_start — enter replay mode', async (t) => {
       const available = await evaluate(wv(`${REPLAY_API}.isReplayAvailable()`));
-      if (!available) return; // Skip if replay not available for current symbol
+      if (!available) return t.skip('replay not available for current symbol/timeframe');
 
       await evaluate(`${REPLAY_API}.showReplayToolbar()`);
       await sleep(500);
@@ -1237,18 +1242,18 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
       assert.ok(started, 'Replay started');
     });
 
-    it('replay_step — advance one bar', async () => {
+    it('replay_step — advance one bar', async (t) => {
       const started = await evaluate(wv(`${REPLAY_API}.isReplayStarted()`));
-      if (!started) return; // Skip if replay didn't start
+      if (!started) return t.skip('replay not started');
 
       await evaluate(`${REPLAY_API}.doStep()`);
       const date = await evaluate(wv(`${REPLAY_API}.currentDate()`));
       assert.ok(date !== null && date !== undefined, 'Current date returned');
     });
 
-    it('replay_autoplay — toggle autoplay', async () => {
+    it('replay_autoplay — toggle autoplay', async (t) => {
       const started = await evaluate(wv(`${REPLAY_API}.isReplayStarted()`));
-      if (!started) return;
+      if (!started) return t.skip('replay not started');
 
       await evaluate(`${REPLAY_API}.toggleAutoplay()`);
       await sleep(200);
@@ -1262,9 +1267,9 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
       }
     });
 
-    it('replay_trade — buy action', async () => {
+    it('replay_trade — buy action', async (t) => {
       const started = await evaluate(wv(`${REPLAY_API}.isReplayStarted()`));
-      if (!started) return;
+      if (!started) return t.skip('replay not started');
 
       await evaluate(`${REPLAY_API}.buy()`);
       const position = await evaluate(wv(`${REPLAY_API}.position()`));
@@ -1289,29 +1294,64 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
       assert.ok(typeof status.is_replay_started === 'boolean', 'Replay started state returned');
     });
 
-    it('replay_stop — return to realtime', async () => {
+    it('replay_stop — return to realtime', async (t) => {
       const started = await evaluate(wv(`${REPLAY_API}.isReplayStarted()`));
-      if (!started) return;
+      if (!started) return t.skip('replay not started');
 
       await evaluate(buildExitReplayJS(REPLAY_API));
 
-      // isReplayStarted must flip false AND the main series must reload
-      // realtime bars (the series refetches after switching off replay).
-      let stoppedNow = true;
-      let barCount = 0;
+      // Layout-global verify: isReplayStarted must flip false, no chart model
+      // may remain in replay, and every chart series must reload bars (the
+      // series refetch after switching off replay).
+      let st = null;
       for (let i = 0; i < 20; i++) {
-        stoppedNow = await evaluate(wv(`${REPLAY_API}.isReplayStarted()`));
-        barCount = await evaluate(`(function(){
-          try {
-            var b = ${BARS_PATH};
-            return b.lastIndex() !== null ? (b.lastIndex() - b.firstIndex() + 1) : 0;
-          } catch (e) { return 0; }
-        })()`);
-        if (!stoppedNow && barCount > 0) break;
+        st = await evaluate(buildVerifyExitJS(REPLAY_API));
+        if (st && st.started === false && !st.in_replay && st.bar_count > 0) break;
         await sleep(500);
       }
-      assert.ok(!stoppedNow, 'Replay stopped');
-      assert.ok(barCount > 0, 'Main series reloaded realtime bars');
+      assert.ok(st && st.started === false, 'Replay stopped');
+      assert.ok(st && !st.in_replay, 'No chart model left in replay');
+      assert.ok(st && st.bar_count > 0, 'All chart series reloaded realtime bars');
+    });
+
+    it('replay exit — recovers a wedged stop latch (deterministic)', async (t) => {
+      // Reproduce the historical wedge WITHOUT tripping TV's assert: start
+      // replay, then stick the manager's _isReplayStopping latch. In that state
+      // every native stop path (stopReplay/goToRealtime/toolbar X) silently
+      // no-ops — only the exit sequence's unwedge can recover.
+      const available = await evaluate(wv(`${REPLAY_API}.isReplayAvailable()`));
+      if (!available) return t.skip('replay not available for current symbol/timeframe');
+
+      await evaluate(`${REPLAY_API}.showReplayToolbar()`);
+      await sleep(500);
+      await evaluate(`${REPLAY_API}.selectFirstAvailableDate()`);
+      let started = false;
+      for (let i = 0; i < 20; i++) {
+        started = await evaluate(wv(`${REPLAY_API}.isReplayStarted()`));
+        if (started) break;
+        await sleep(500);
+      }
+      if (!started) return t.skip('replay did not start — cannot exercise the wedge');
+
+      await evaluate(`${REPLAY_API}._replayUIController._replayManager._isReplayStopping = true`);
+      // Confirm the wedge is real: the native stop path must now no-op.
+      await evaluate(`${REPLAY_API}.stopReplay()`);
+      await sleep(300);
+      const stillStuck = await evaluate(wv(`${REPLAY_API}.isReplayStarted()`));
+      assert.ok(stillStuck, 'sanity: native stopReplay() no-ops while the latch is stuck');
+
+      const exit = await evaluate(buildExitReplayJS(REPLAY_API));
+      assert.ok(exit && exit.steps && exit.steps.includes('unwedgedForceStop'),
+        `exit took the unwedge path (steps: ${JSON.stringify(exit && exit.steps)})`);
+
+      let st = null;
+      for (let i = 0; i < 20; i++) {
+        st = await evaluate(buildVerifyExitJS(REPLAY_API));
+        if (st && st.started === false && !st.in_replay && st.bar_count > 0) break;
+        await sleep(500);
+      }
+      assert.ok(st && st.started === false, 'wedged replay was stopped');
+      assert.ok(st && st.bar_count > 0, 'chart series reloaded realtime bars after unwedge');
     });
   });
 

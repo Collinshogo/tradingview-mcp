@@ -79,21 +79,46 @@ export function buildExitReplayJS(rp) {
   })()`;
 }
 
-// Post-exit state: replay flags + whether the main series carries realtime bars
-// again (after a real exit the series switches to realtime and reloads).
+// Post-exit state: replay flags + whether the chart series carry realtime bars
+// again (after a real exit the series switch to realtime and reload). Replay is
+// LAYOUT-GLOBAL (the manager stops every in-replay model, not just the active
+// pane), so the survey walks _chartWidgetCollection.getAll() — checking only
+// the active widget would report success on the wrong chart in multi-chart
+// layouts. Falls back to the active widget if the collection is unavailable.
+// bar_count is the MINIMUM across charts (all series reloaded), last_bar_time
+// the maximum; replay_date is the current replay point (null when not in
+// replay) so callers can tell reloaded realtime bars from stale replay bars.
 export function buildVerifyExitJS(rp) {
   return `(function(){ /* replay-verify */
     var rp = ${rp};
     function val(v){ return (v && typeof v === 'object' && typeof v.value === 'function') ? v.value() : v; }
-    var out = { started: null, mode_enabled: null, in_replay: null, bar_count: 0 };
+    var out = { started: null, mode_enabled: null, in_replay: null, bar_count: null, last_bar_time: null, replay_date: null, charts: 0 };
     try { out.started = !!val(rp.isReplayStarted()); } catch (e) {}
     try { out.mode_enabled = !!val(rp._replayUIController.isReplayModeEnabled()); } catch (e) {}
-    try {
-      var model = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget.model();
-      out.in_replay = !!val(model.isInReplay());
+    try { var d = val(rp.currentDate()); out.replay_date = (d === undefined ? null : d); } catch (e) {}
+    function survey(model) {
+      out.charts++;
+      if (val(model.isInReplay())) out.in_replay = true;
       var bars = model.mainSeries().bars();
-      out.bar_count = bars.lastIndex() !== null ? (bars.lastIndex() - bars.firstIndex() + 1) : 0;
-    } catch (e) {}
+      var n = bars.lastIndex() !== null ? (bars.lastIndex() - bars.firstIndex() + 1) : 0;
+      if (out.bar_count === null || n < out.bar_count) out.bar_count = n;
+      var last = bars.lastIndex() !== null ? bars.valueAt(bars.lastIndex()) : null;
+      if (last && (out.last_bar_time === null || last[0] > out.last_bar_time)) out.last_bar_time = last[0];
+    }
+    try {
+      var widgets = window.TradingViewApi._chartWidgetCollection.getAll();
+      out.in_replay = false;
+      for (var i = 0; i < widgets.length; i++) {
+        try { if (widgets[i].hasModel()) survey(widgets[i].model()); } catch (e) {}
+      }
+    } catch (e) {
+      try {
+        var model = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget.model();
+        out.in_replay = false;
+        survey(model);
+      } catch (e2) {}
+    }
+    if (out.bar_count === null) out.bar_count = 0;
     return out;
   })()`;
 }
@@ -120,8 +145,54 @@ export function buildClearReplayResidueJS() {
   })()`;
 }
 
+// Run the exit sequence and confirm it STICKS. A selectDate promise still in
+// flight can re-start replay AFTER the exit ran (buildExitReplayJS is
+// synchronous; the facade's async start path resumes afterwards), so this
+// watches the flags and re-exits if replay comes back, and requires two
+// consecutive clean snapshots before trusting the state. Never throws for
+// state reasons — returns what it observed.
+async function _exitAndSettle({ evaluate, sleep, rp, polls, intervalMs }) {
+  let exit = await evaluate(buildExitReplayJS(rp));
+  const steps = (exit && exit.steps) ? [...exit.steps] : [];
+  let reExits = 0;
+  let cleanStreak = 0;
+  let st = null;
+  for (let i = 0; i < polls; i++) {
+    st = await evaluate(buildVerifyExitJS(rp));
+    // mode_enabled/in_replay read TV private paths and come back null when
+    // unreadable — treat null as "unknown, don't block". started is the public
+    // facade API and stays a strict gate.
+    const flagsClean = !!st && st.started === false && st.mode_enabled !== true && st.in_replay !== true;
+    if (flagsClean) {
+      cleanStreak++;
+      if (cleanStreak >= 2 && st.bar_count > 0) {
+        return { settled: true, flagsClean: true, st, steps };
+      }
+    } else {
+      cleanStreak = 0;
+      if (st && st.started === true && reExits < 2) {
+        exit = await evaluate(buildExitReplayJS(rp));
+        if (exit && exit.steps) steps.push(...exit.steps.map(s => 're-exit:' + s));
+        reExits++;
+      }
+    }
+    if (i < polls - 1) await sleep(intervalMs);
+  }
+  const finalClean = !!st && st.started === false && st.mode_enabled !== true && st.in_replay !== true && cleanStreak >= 1;
+  return { settled: false, flagsClean: finalClean, st, steps };
+}
+
 export async function start({ date, _deps } = {}) {
-  const { evaluate, getReplayApi } = _resolve(_deps);
+  const { evaluate, getReplayApi, sleep } = _resolve(_deps);
+
+  // Validate BEFORE any CDP calls (same rule as autoplay()) — throwing after
+  // showReplayToolbar() would leave the bar-picker armed with no cleanup.
+  let ts = null;
+  if (date) {
+    ts = new Date(date).getTime();
+    if (isNaN(ts)) throw new Error(`Invalid date: "${date}". Use YYYY-MM-DD format.`);
+  }
+
   const rp = await getReplayApi();
   const available = await evaluate(wv(`${rp}.isReplayAvailable()`));
   if (!available) throw new Error('Replay is not available for the current symbol/timeframe');
@@ -133,16 +204,25 @@ export async function start({ date, _deps } = {}) {
 
   await evaluate(`${rp}.showReplayToolbar()`);
 
-  // selectDate() is async — it calls enableReplayMode() then _onPointSelected()
-  // which initializes the server-side replay session. Must be awaited inside the
-  // page context, otherwise the promise is fire-and-forget and replay state says
-  // "started" but stepping doesn't work (issue #26).
-  if (date) {
-    const ts = new Date(date).getTime();
-    if (isNaN(ts)) throw new Error(`Invalid date: "${date}". Use YYYY-MM-DD format.`);
-    await evaluate(`${rp}.selectDate(${ts}).then(function() { return 'ok'; })`);
-  } else {
-    await evaluate(`${rp}.selectFirstAvailableDate()`);
+  // selectDate() is async — it awaits enableReplayMode() and the controller's
+  // point selection, which initialize the server-side replay session. Await the
+  // page promise for real ({awaitPromise: true} — a bare .then() chain gives no
+  // CDP-level synchronization) so TV's own rejection surfaces as an error
+  // instead of a silent unhandled rejection plus a generic timeout (issue #26).
+  // The page-side race resolves 'timeout' rather than hanging the CDP call if
+  // the promise never settles; the readiness poll below stays the real gate.
+  const call = ts !== null ? `selectDate(${ts})` : 'selectFirstAvailableDate()';
+  try {
+    await evaluate(
+      `Promise.race([
+        Promise.resolve(${rp}.${call}).then(function() { return 'ok'; }),
+        new Promise(function(resolve) { setTimeout(function() { resolve('timeout'); }, 25000); })
+      ])`,
+      { awaitPromise: true },
+    );
+  } catch (err) {
+    try { await _exitAndSettle({ evaluate, sleep, rp, polls: 6, intervalMs: 500 }); } catch { /* best-effort */ }
+    throw new Error(`Replay failed to start: ${err.message}`);
   }
 
   // Poll until replay is fully initialized: isReplayStarted AND currentDate is set.
@@ -154,21 +234,25 @@ export async function start({ date, _deps } = {}) {
     started = await evaluate(wv(`${rp}.isReplayStarted()`));
     currentDate = await evaluate(wv(`${rp}.currentDate()`));
     if (started && currentDate !== null) break;
-    await new Promise(r => setTimeout(r, 250));
+    await sleep(250);
   }
 
-  if (!started) {
-    // Use the full exit sequence, not bare stopReplay() — a stop call in a
-    // half-started state is exactly what wedges TV's replay manager.
-    try { await evaluate(buildExitReplayJS(rp)); } catch {}
-    throw new Error('Replay failed to start. The selected date may not have data for this timeframe. Try a more recent date or a higher timeframe (e.g., Daily).');
+  if (!started || currentDate === null) {
+    // Unwind the half-started replay with the full exit sequence — a bare
+    // stopReplay() in a half-started state is exactly what wedges TV's replay
+    // manager, and a still-pending selectDate can re-start replay after the
+    // exit, which _exitAndSettle watches for.
+    try { await _exitAndSettle({ evaluate, sleep, rp, polls: 6, intervalMs: 500 }); } catch { /* best-effort */ }
+    throw new Error(!started
+      ? 'Replay failed to start. The selected date may not have data for this timeframe. Try a more recent date or a higher timeframe (e.g., Daily).'
+      : 'Replay half-started: isReplayStarted flipped true but the replay session never delivered a current date, so stepping would not work. Replay has been exited. Try a more recent date or a higher timeframe (e.g., Daily).');
   }
 
   return { success: true, replay_started: true, date: date || '(first available)', current_date: currentDate };
 }
 
 export async function step({ _deps } = {}) {
-  const { evaluate, getReplayApi } = _resolve(_deps);
+  const { evaluate, getReplayApi, sleep } = _resolve(_deps);
   const rp = await getReplayApi();
   const started = await evaluate(wv(`${rp}.isReplayStarted()`));
   if (!started) throw new Error('Replay is not started. Use replay_start first.');
@@ -178,7 +262,7 @@ export async function step({ _deps } = {}) {
   // Poll until it changes or timeout after 3s.
   let currentDate = before;
   for (let i = 0; i < 12; i++) {
-    await new Promise(r => setTimeout(r, 250));
+    await sleep(250);
     currentDate = await evaluate(wv(`${rp}.currentDate()`));
     if (currentDate !== before) break;
   }
@@ -208,32 +292,41 @@ export async function stop({ _deps } = {}) {
   const rp = await getReplayApi();
 
   const pre = await evaluate(buildVerifyExitJS(rp));
-  if (pre && pre.started === false && pre.mode_enabled === false) {
+  if (pre && pre.started === false && pre.mode_enabled !== true && pre.in_replay !== true) {
     // Nothing running — still clear resume-dialog residue so the next start
     // is deterministic.
     try { await evaluate(buildClearReplayResidueJS()); } catch { /* best-effort */ }
     return { success: true, action: 'already_stopped' };
   }
 
-  const exit = await evaluate(buildExitReplayJS(rp));
+  // Exit and verify it took: isReplayStarted must flip false (two consecutive
+  // clean snapshots, re-exiting if a pending start races us) and the chart
+  // series should reload realtime bars — usually <1s, polled up to 10s.
+  const { settled, flagsClean, st, steps } = await _exitAndSettle({ evaluate, sleep, rp, polls: 20, intervalMs: 500 });
 
-  // Verify the exit actually took: isReplayStarted must flip false, replay
-  // mode must be off, and the main series must reload realtime bars (the
-  // series switches to realtime and refetches — usually <1s, poll up to 10s).
-  let st = null;
-  for (let i = 0; i < 20; i++) {
-    st = await evaluate(buildVerifyExitJS(rp));
-    if (st && st.started === false && st.mode_enabled === false && !st.in_replay && st.bar_count > 0) {
-      return {
-        success: true,
-        action: 'replay_stopped',
-        realtime_bars: st.bar_count,
-        steps: (exit && exit.steps) || [],
-      };
+  if (settled) {
+    const result = { success: true, action: 'replay_stopped', realtime_bars: st.bar_count, steps };
+    // Bars present but not newer than the replay point ⇒ possibly still the
+    // replay-era series awaiting its realtime refetch. Advisory only.
+    if (pre && pre.replay_date != null && st.last_bar_time != null && st.last_bar_time <= pre.replay_date) {
+      result.warning = 'Chart bars are not newer than the replay point yet — the realtime reload may still be in flight.';
     }
-    await sleep(500);
+    return result;
   }
-  throw new Error(`Replay did not fully exit (state: ${JSON.stringify(st)}). The replay manager may be wedged — reload the TradingView page (chart layout is cloud-saved) and try again.`);
+  if (flagsClean) {
+    // The exit took (all replay flags off) but bars had not reloaded within the
+    // poll window. That is a slow/failed series refetch, NOT a wedged manager —
+    // report success with a warning instead of steering the caller to a
+    // destructive page reload (an immediate retry would say already_stopped).
+    return {
+      success: true,
+      action: 'replay_stopped',
+      realtime_bars: (st && st.bar_count) || 0,
+      steps,
+      warning: 'Replay is off but the chart series had not finished reloading realtime bars within 10s — verify the chart shows data before relying on reads.',
+    };
+  }
+  throw new Error(`Replay did not fully exit (state: ${JSON.stringify(st)}; exit steps: ${JSON.stringify(steps)}). The replay manager may be wedged — reload the TradingView page (chart layout is cloud-saved) and try again.`);
 }
 
 export async function trade({ action, _deps }) {
