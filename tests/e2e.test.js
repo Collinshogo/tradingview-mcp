@@ -22,6 +22,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import CDP from 'chrome-remote-interface';
+import { buildExitReplayJS } from '../src/core/replay.js';
 
 let client;
 let Runtime;
@@ -1157,17 +1158,21 @@ val = array.get(a, 5)`;
 
   describe('Replay Mode', () => {
 
+    // NEVER call goToRealtime()/stopReplay() on an already-stopped replay:
+    // TV's ReplayManager._stopReplay() latches _isReplayStopping=true before an
+    // assert with no try/finally, so one such call silently disables every
+    // future stop until the page is reloaded (the pre-2026-07 version of this
+    // cleanup did exactly that and wedged the live session). The shared exit
+    // sequence from src/core/replay.js is safe in every state.
+    before(async () => {
+      try { await evaluate(buildExitReplayJS(REPLAY_API)); } catch {}
+    });
+
     after(async () => {
       // Ensure replay is stopped
       try {
-        const rp = REPLAY_API;
-        const started = await evaluate(wv(`${rp}.isReplayStarted()`));
-        if (started) {
-          await evaluate(`${rp}.stopReplay()`);
-          await evaluate(`${rp}.goToRealtime()`);
-          await evaluate(`${rp}.hideReplayToolbar()`);
-          await sleep(500);
-        }
+        await evaluate(buildExitReplayJS(REPLAY_API));
+        await sleep(500);
       } catch {}
     });
 
@@ -1240,13 +1245,25 @@ val = array.get(a, 5)`;
       const started = await evaluate(wv(`${REPLAY_API}.isReplayStarted()`));
       if (!started) return;
 
-      await evaluate(`${REPLAY_API}.stopReplay()`);
-      await evaluate(`${REPLAY_API}.goToRealtime()`);
-      await evaluate(`${REPLAY_API}.hideReplayToolbar()`);
-      await sleep(500);
+      await evaluate(buildExitReplayJS(REPLAY_API));
 
-      const stoppedNow = await evaluate(wv(`${REPLAY_API}.isReplayStarted()`));
+      // isReplayStarted must flip false AND the main series must reload
+      // realtime bars (the series refetches after switching off replay).
+      let stoppedNow = true;
+      let barCount = 0;
+      for (let i = 0; i < 20; i++) {
+        stoppedNow = await evaluate(wv(`${REPLAY_API}.isReplayStarted()`));
+        barCount = await evaluate(`(function(){
+          try {
+            var b = ${BARS_PATH};
+            return b.lastIndex() !== null ? (b.lastIndex() - b.firstIndex() + 1) : 0;
+          } catch (e) { return 0; }
+        })()`);
+        if (!stoppedNow && barCount > 0) break;
+        await sleep(500);
+      }
       assert.ok(!stoppedNow, 'Replay stopped');
+      assert.ok(barCount > 0, 'Main series reloaded realtime bars');
     });
   });
 

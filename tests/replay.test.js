@@ -5,7 +5,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { start, step, autoplay, stop, trade, status, VALID_AUTOPLAY_DELAYS } from '../src/core/replay.js';
+import { start, step, autoplay, stop, trade, status, VALID_AUTOPLAY_DELAYS, buildExitReplayJS, buildVerifyExitJS, buildClearReplayResidueJS } from '../src/core/replay.js';
 
 // ── Mock helpers ─────────────────────────────────────────────────────────
 
@@ -117,14 +117,15 @@ describe('start() — date selection and polling', () => {
     assert.ok(pollCount >= 4, 'polled multiple times');
   });
 
-  it('throws and stops replay when polling times out (never started)', async () => {
-    let stopCalled = false;
+  it('throws and runs the full exit sequence when polling times out (never started)', async () => {
+    let exitCalled = false;
     const evaluate = async (expr) => {
+      if (expr.includes('replay-exit')) { exitCalled = true; return undefined; }
+      if (expr.includes('replay-cleanup')) return undefined;
       if (expr.includes('isReplayAvailable')) return true;
       if (expr.includes('showReplayToolbar') || expr.includes('selectDate')) return 'ok';
       if (expr.includes('isReplayStarted')) return false; // never starts
       if (expr.includes('currentDate')) return null;
-      if (expr.includes('stopReplay')) { stopCalled = true; return undefined; }
       return undefined;
     };
     evaluate.calls = [];
@@ -135,7 +136,22 @@ describe('start() — date selection and polling', () => {
         return true;
       },
     );
-    assert.ok(stopCalled, 'stopReplay called for cleanup');
+    assert.ok(exitCalled, 'full exit sequence ran for cleanup');
+  });
+
+  it('clears resume-dialog residue before enabling replay mode', async () => {
+    const { _deps, evaluate } = mockDeps({
+      'isReplayAvailable': true,
+      'showReplayToolbar': undefined,
+      'selectDate': 'ok',
+      'isReplayStarted': true,
+      'currentDate': 1773532799,
+    });
+    await start({ date: '2026-03-15', _deps });
+    const cleanupIdx = evaluate.calls.findIndex(c => c.includes('replay-cleanup'));
+    const toolbarIdx = evaluate.calls.findIndex(c => c.includes('showReplayToolbar'));
+    assert.ok(cleanupIdx !== -1, 'residue cleanup ran');
+    assert.ok(cleanupIdx < toolbarIdx, 'cleanup runs before the toolbar opens (prevents the resume dialog)');
   });
 });
 
@@ -257,29 +273,92 @@ describe('autoplay() — delay validation', () => {
 // ── stop() ───────────────────────────────────────────────────────────────
 
 describe('stop()', () => {
-  it('calls stopReplay when started', async () => {
-    const { _deps, evaluate } = mockDeps({
-      'isReplayStarted': true,
-      'stopReplay': undefined,
-    });
-    const result = await stop({ _deps });
+  const noSleep = async () => {};
+
+  it('runs the exit sequence and verifies realtime recovery when started', async () => {
+    const calls = [];
+    const evaluate = async (expr) => {
+      calls.push(expr);
+      if (expr.includes('replay-verify')) {
+        const exited = calls.some(c => c.includes('replay-exit'));
+        return exited
+          ? { started: false, mode_enabled: false, in_replay: false, bar_count: 300 }
+          : { started: true, mode_enabled: true, in_replay: true, bar_count: 0 };
+      }
+      if (expr.includes('replay-exit')) return { steps: ['stopReplay'], started: false };
+      return undefined;
+    };
+    const result = await stop({ _deps: { evaluate, getReplayApi: mockGetReplayApi(), sleep: noSleep } });
     assert.equal(result.success, true);
     assert.equal(result.action, 'replay_stopped');
-    const stopCall = evaluate.calls.find(c => c.includes('stopReplay'));
-    assert.ok(stopCall, 'stopReplay was called');
+    assert.equal(result.realtime_bars, 300);
+    assert.deepEqual(result.steps, ['stopReplay']);
+    assert.ok(calls.some(c => c.includes('replay-exit')), 'exit sequence ran');
   });
 
-  it('returns already_stopped when not started', async () => {
-    const { _deps, evaluate } = mockDeps({ 'isReplayStarted': false });
-    const result = await stop({ _deps });
+  it('exits even when only replay MODE is on (manager already stopped)', async () => {
+    const calls = [];
+    const evaluate = async (expr) => {
+      calls.push(expr);
+      if (expr.includes('replay-verify')) {
+        const exited = calls.some(c => c.includes('replay-exit'));
+        return exited
+          ? { started: false, mode_enabled: false, in_replay: false, bar_count: 120 }
+          : { started: false, mode_enabled: true, in_replay: false, bar_count: 0 };
+      }
+      if (expr.includes('replay-exit')) return { steps: ['closedReplayMode'], started: false };
+      return undefined;
+    };
+    const result = await stop({ _deps: { evaluate, getReplayApi: mockGetReplayApi(), sleep: noSleep } });
+    assert.equal(result.action, 'replay_stopped');
+  });
+
+  it('returns already_stopped (and clears residue only) when fully off', async () => {
+    const calls = [];
+    const evaluate = async (expr) => {
+      calls.push(expr);
+      if (expr.includes('replay-verify')) return { started: false, mode_enabled: false, in_replay: false, bar_count: 300 };
+      return undefined;
+    };
+    const result = await stop({ _deps: { evaluate, getReplayApi: mockGetReplayApi(), sleep: noSleep } });
     assert.equal(result.action, 'already_stopped');
-    const stopCall = evaluate.calls.find(c => c.includes('stopReplay'));
-    assert.equal(stopCall, undefined, 'stopReplay not called');
+    assert.ok(!calls.some(c => c.includes('replay-exit')), 'exit sequence not run');
+    assert.ok(calls.some(c => c.includes('replay-cleanup')), 'resume-dialog residue cleared');
+  });
+
+  it('throws with reload guidance when the exit never takes', async () => {
+    const evaluate = async (expr) => {
+      if (expr.includes('replay-verify')) return { started: true, mode_enabled: false, in_replay: true, bar_count: 0 };
+      if (expr.includes('replay-exit')) return { steps: ['stopReplay-err:wedged'], started: true };
+      return undefined;
+    };
+    await assert.rejects(
+      () => stop({ _deps: { evaluate, getReplayApi: mockGetReplayApi(), sleep: noSleep } }),
+      (err) => {
+        assert.ok(err.message.includes('did not fully exit'));
+        assert.ok(err.message.includes('reload'));
+        return true;
+      },
+    );
   });
 
   it('does not call hideReplayToolbar', () => {
     const source = readFileSync(new URL('../src/core/replay.js', import.meta.url), 'utf8');
     assert.ok(!source.includes('hideReplayToolbar'), 'hideReplayToolbar must not appear anywhere');
+  });
+
+  it('exit JS carries the unwedge + resume-dialog recipe', () => {
+    const js = buildExitReplayJS('window.__rp');
+    assert.ok(js.includes('_isReplayStopping = false'), 'clears the stuck stopping latch');
+    assert.ok(js.includes('_forceStopReplay'), 'force-stops the wedged manager');
+    assert.ok(js.includes('requestCloseReplay(true)'), 'closes replay mode without the confirm dialog');
+    assert.ok(js.includes('updateReplaySessionState(null)'), 'clears the saved session state');
+    assert.ok(js.includes('continue_replay_warning'), 'dismisses the resume dialog');
+    assert.ok(!js.includes('goToRealtime'), 'never calls goToRealtime (the wedge trigger)');
+    const verify = buildVerifyExitJS('window.__rp');
+    assert.ok(verify.includes('isReplayStarted') && verify.includes('bars()'), 'verify reads flag + bars');
+    const cleanup = buildClearReplayResidueJS();
+    assert.ok(!cleanup.includes('stopReplay') && !cleanup.includes('_forceStopReplay'), 'residue cleanup never pokes the stop machinery');
   });
 });
 
@@ -288,7 +367,7 @@ describe('stop()', () => {
 describe('trade()', () => {
   for (const action of ['buy', 'sell', 'close']) {
     it(`executes ${action} action`, async () => {
-      const { _deps, evaluate } = mockDeps({
+      const { _deps } = mockDeps({
         'isReplayStarted': true,
         [action === 'close' ? 'closePosition' : action]: undefined,
         'position': 1,
