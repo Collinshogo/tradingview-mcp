@@ -35,12 +35,54 @@ const FIND_MONACO = `
   })()
 `;
 
+// ── Pine editor facade/store finder (injected into TV page) ──
+// The editor's script-title button sits inside the React tree that carries
+// the editor facade (openScript/openNewScript — the same internal API
+// TradingView's own script-name dropdown uses) and the editor's redux store,
+// whose `script` slice identifies the script the VISIBLE editor holds.
+const FIND_EDITOR_PARTS = `
+  (function findPineEditorParts() {
+    var btn = document.querySelector('[data-qa-id="pine-script-title-button"]')
+      || document.querySelector('[class*="nameButton"]');
+    if (!btn) return null;
+    var fiberKey = Object.keys(btn).find(function(k) { return k.startsWith('__reactFiber$'); });
+    if (!fiberKey) return null;
+    var cur = btn[fiberKey];
+    var facade = null;
+    var store = null;
+    for (var d = 0; d < 40 && cur; d++) {
+      var p = cur.memoizedProps;
+      if (p && typeof p === 'object') {
+        if (!facade && p.facade && typeof p.facade.openScript === 'function') facade = p.facade;
+        if (!store && p.store && typeof p.store.getState === 'function') store = p.store;
+      }
+      cur = cur.return;
+    }
+    if (!facade || !store) return null;
+    return { facade: facade, store: store, titleButton: btn };
+  })()
+`;
+
+const defaultDeps = {
+  evaluate,
+  evaluateAsync,
+  delay: (ms) => new Promise(r => setTimeout(r, ms)),
+};
+
+// The script pine_open last switched the editor to (or the draft pine_new
+// created). pine_set_source refuses to write when the visible editor no
+// longer shows this script — writing anyway is exactly how one saved script
+// gets silently overwritten with another script's source.
+let lastOpenTarget = null;
+
+export function _resetEditorTargetState() { lastOpenTarget = null; }
+
 /**
  * Opens the Pine Editor panel and waits for Monaco to become available.
  * Returns true if editor is accessible, false on timeout.
  */
-export async function ensurePineEditorOpen() {
-  const already = await evaluate(`
+export async function ensurePineEditorOpen(deps = defaultDeps) {
+  const already = await deps.evaluate(`
     (function() {
       var m = ${FIND_MONACO};
       return m !== null;
@@ -48,7 +90,7 @@ export async function ensurePineEditorOpen() {
   `);
   if (already) return true;
 
-  await evaluate(`
+  await deps.evaluate(`
     (function() {
       var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
       if (!bwb) return;
@@ -57,7 +99,7 @@ export async function ensurePineEditorOpen() {
     })()
   `);
 
-  await evaluate(`
+  await deps.evaluate(`
     (function() {
       var btn = document.querySelector('[aria-label="Pine"]')
         || document.querySelector('[data-name="pine-dialog-button"]');
@@ -66,11 +108,47 @@ export async function ensurePineEditorOpen() {
   `);
 
   for (let i = 0; i < 50; i++) {
-    await new Promise(r => setTimeout(r, 200));
-    const ready = await evaluate(`(function() { return ${FIND_MONACO} !== null; })()`);
+    await deps.delay(200);
+    const ready = await deps.evaluate(`(function() { return ${FIND_MONACO} !== null; })()`);
     if (ready) return true;
   }
   return false;
+}
+
+/**
+ * Reads the identity of the script the visible editor currently holds,
+ * straight from the Pine editor's own store. Returns null when the editor
+ * state cannot be reached (editor closed, or TV changed its internals).
+ */
+async function getActiveScript(deps) {
+  return deps.evaluate(`
+    (function() { /* tv-mcp:active-script */
+      var parts = ${FIND_EDITOR_PARTS};
+      if (!parts) return null;
+      var s = parts.store.getState().script || {};
+      return {
+        script_id: s.scriptIdPart || null,
+        script_name: s.scriptName || null,
+        script_title: s.scriptTitle || null,
+        version: s.version || null,
+        editor_title: (parts.titleButton.textContent || '').trim(),
+      };
+    })()
+  `);
+}
+
+/**
+ * Picks the saved-script record matching `name`: exact match on scriptName or
+ * scriptTitle first (case-insensitive), then substring match. Pure — exported
+ * for tests.
+ */
+export function pickScriptRecord(scripts, name) {
+  const target = String(name).toLowerCase();
+  const nameOf = (s) => (s.scriptName || '').toLowerCase();
+  const titleOf = (s) => (s.scriptTitle || '').toLowerCase();
+  return scripts.find(s => nameOf(s) === target || titleOf(s) === target)
+    || scripts.find(s => nameOf(s).includes(target) || titleOf(s).includes(target))
+    || null;
 }
 
 // ── Pure / offline functions ──
@@ -244,11 +322,12 @@ export async function check({ source }) {
 
 // ── Functions requiring TradingView connection ──
 
-export async function getSource() {
-  const editorReady = await ensurePineEditorOpen();
+export async function getSource({ _deps } = {}) {
+  const deps = { ...defaultDeps, ..._deps };
+  const editorReady = await ensurePineEditorOpen(deps);
   if (!editorReady) throw new Error('Could not open Pine Editor or Monaco not found in React fiber tree.');
 
-  const source = await evaluate(`
+  const source = await deps.evaluate(`
     (function() {
       var m = ${FIND_MONACO};
       if (!m) return null;
@@ -260,16 +339,45 @@ export async function getSource() {
     throw new Error('Monaco editor found but getValue() returned null.');
   }
 
-  return { success: true, source, line_count: source.split('\n').length, char_count: source.length };
+  const active = await getActiveScript(deps);
+  return {
+    success: true,
+    source,
+    line_count: source.split('\n').length,
+    char_count: source.length,
+    script_id: active?.script_id ?? null,
+    script_name: active?.script_name ?? null,
+  };
 }
 
-export async function setSource({ source }) {
-  const editorReady = await ensurePineEditorOpen();
+export async function setSource({ source, _deps }) {
+  const deps = { ...defaultDeps, ..._deps };
+  const editorReady = await ensurePineEditorOpen(deps);
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
+  // Guard against the cross-script clobber: the editor may be showing a
+  // different script than the one pine_open last targeted (user switched
+  // scripts, or an earlier open silently failed). Verify before writing.
+  const active = await getActiveScript(deps);
+  if (lastOpenTarget) {
+    if (!active) {
+      throw new Error('Cannot verify which script the editor is showing (editor state unreadable) — refusing to write. Re-run pine_open.');
+    }
+    const wrongScript = lastOpenTarget.draft
+      ? Boolean(active.script_id)
+      : active.script_id !== lastOpenTarget.scriptIdPart;
+    if (wrongScript) {
+      throw new Error(
+        `Editor is showing "${active.script_name}" (${active.script_id || 'unsaved draft'}) but the last ` +
+        `pine_open/pine_new target was "${lastOpenTarget.name}" (${lastOpenTarget.scriptIdPart || 'unsaved draft'}). ` +
+        'Refusing to write into the wrong script — call pine_open again to switch.'
+      );
+    }
+  }
+
   const escaped = JSON.stringify(source);
-  const set = await evaluate(`
-    (function() {
+  const set = await deps.evaluate(`
+    (function() { /* tv-mcp:set-source */
       var m = ${FIND_MONACO};
       if (!m) return false;
       m.editor.setValue(${escaped});
@@ -278,7 +386,13 @@ export async function setSource({ source }) {
   `);
 
   if (!set) throw new Error('Monaco found but setValue() failed.');
-  return { success: true, lines_set: source.split('\n').length };
+  return {
+    success: true,
+    lines_set: source.split('\n').length,
+    script_id: active?.script_id ?? null,
+    script_name: active?.script_name ?? null,
+    verified_against_target: Boolean(lastOpenTarget),
+  };
 }
 
 export async function compile() {
@@ -505,87 +619,157 @@ export async function smartCompile() {
   };
 }
 
-export async function newScript({ type }) {
-  const editorReady = await ensurePineEditorOpen();
+export async function newScript({ type, _deps }) {
+  const deps = { ...defaultDeps, ..._deps };
+  const editorReady = await ensurePineEditorOpen(deps);
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
-  const typeMap = { indicator: 'indicator', strategy: 'strategy', library: 'library' };
-  const templates = {
-    indicator: '//@version=6\nindicator("My script")\nplot(close)',
-    strategy: '//@version=6\nstrategy("My strategy", overlay=true)\n',
-    library: '//@version=6\n// @description TODO: add library description here\nlibrary("MyLibrary")\n',
-  };
+  const kinds = ['indicator', 'strategy', 'library'];
+  const kind = kinds.includes(type) ? type : 'indicator';
 
-  const template = templates[type] || templates.indicator;
-
-  // Simply set the source to a new template — this is the most reliable approach
-  const escaped = JSON.stringify(template);
-  const set = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return false;
-      m.editor.setValue(${escaped});
-      return true;
+  // Drive the editor's own create-new flow (facade.openNewScript is what the
+  // script-name dropdown's "Create new" menu calls) — setValue()-ing a
+  // template into the current tab does NOT create a script and clobbers
+  // whatever is open.
+  const created = await deps.evaluateAsync(`
+    (function() { /* tv-mcp:new-script */
+      var parts = ${FIND_EDITOR_PARTS};
+      if (!parts) return Promise.resolve({ error: 'Pine editor facade not found — is the Pine Editor open and its script-title button visible?' });
+      if (typeof parts.facade.openNewScript !== 'function') return Promise.resolve({ error: 'openNewScript not available on editor facade' });
+      return Promise.resolve(parts.facade.openNewScript(${JSON.stringify(kind)}))
+        .then(function() { return { ok: true }; })
+        .catch(function(e) { return { error: e && e.message ? e.message : String(e) }; });
     })()
   `);
+  if (created?.error) throw new Error(created.error);
 
-  if (!set) throw new Error('Monaco editor not found. Ensure Pine Editor is open.');
-
-  return { success: true, type, action: 'new_script_created', template: typeMap[type] };
-}
-
-export async function openScript({ name }) {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor.');
-
-  const escapedName = JSON.stringify(name.toLowerCase());
-
-  const result = await evaluateAsync(`
-    (function() {
-      var target = ${escapedName};
-      return fetch('https://pine-facade.tradingview.com/pine-facade/list/?filter=saved', { credentials: 'include' })
-        .then(function(r) { return r.json(); })
-        .then(function(scripts) {
-          if (!Array.isArray(scripts)) return {error: 'pine-facade returned unexpected data'};
-          var match = null;
-          for (var i = 0; i < scripts.length; i++) {
-            var sn = (scripts[i].scriptName || '').toLowerCase();
-            var st = (scripts[i].scriptTitle || '').toLowerCase();
-            if (sn === target || st === target) { match = scripts[i]; break; }
-          }
-          if (!match) {
-            for (var j = 0; j < scripts.length; j++) {
-              var sn2 = (scripts[j].scriptName || '').toLowerCase();
-              var st2 = (scripts[j].scriptTitle || '').toLowerCase();
-              if (sn2.indexOf(target) !== -1 || st2.indexOf(target) !== -1) { match = scripts[j]; break; }
-            }
-          }
-          if (!match) return {error: 'Script "' + target + '" not found. Use pine_list_scripts to see available scripts.'};
-
-          var id = match.scriptIdPart;
-          var ver = match.version || 1;
-          return fetch('https://pine-facade.tradingview.com/pine-facade/get/' + id + '/' + ver, { credentials: 'include' })
-            .then(function(r2) { return r2.json(); })
-            .then(function(data) {
-              var source = data.source || '';
-              if (!source) return {error: 'Script source is empty', name: match.scriptName || match.scriptTitle};
-              var m = ${FIND_MONACO};
-              if (m) {
-                m.editor.setValue(source);
-                return {success: true, name: match.scriptName || match.scriptTitle, id: id, lines: source.split('\\n').length};
-              }
-              return {error: 'Monaco editor not found to inject source', name: match.scriptName || match.scriptTitle};
-            });
-        })
-        .catch(function(e) { return {error: e.message}; });
-    })()
-  `);
-
-  if (result?.error) {
-    throw new Error(result.error);
+  // Verify the editor actually landed on an untitled draft of the right kind
+  // before reporting success — the old implementation reported
+  // new_script_created without creating anything.
+  const marker = kind + '(';
+  let active = null;
+  let content = null;
+  for (let i = 0; i < 15; i++) {
+    active = await getActiveScript(deps);
+    content = await deps.evaluate(`
+      (function() { /* tv-mcp:editor-value */
+        var m = ${FIND_MONACO};
+        return m ? m.editor.getValue() : null;
+      })()
+    `);
+    if (active && !active.script_id && typeof content === 'string' && content.includes(marker)) break;
+    await deps.delay(300);
+  }
+  if (!active || active.script_id || typeof content !== 'string' || !content.includes(marker)) {
+    throw new Error(
+      `pine_new did not land on an untitled ${kind} draft — the editor shows ` +
+      `${active ? `"${active.script_name}" (${active.script_id || 'unsaved draft'})` : 'no readable script state'}.`
+    );
   }
 
-  return { success: true, name: result.name, script_id: result.id, lines: result.lines, source: 'internal_api', opened: true };
+  lastOpenTarget = { scriptIdPart: null, name: active.script_name, draft: true };
+
+  return {
+    success: true,
+    type: kind,
+    action: 'new_script_created',
+    script_name: active.script_name,
+    editor_title: active.editor_title,
+    lines: content.split('\n').length,
+    verified: true,
+    source: 'editor_facade',
+  };
+}
+
+export async function openScript({ name, _deps }) {
+  const deps = { ...defaultDeps, ..._deps };
+  const editorReady = await ensurePineEditorOpen(deps);
+  if (!editorReady) throw new Error('Could not open Pine Editor.');
+
+  const list = await deps.evaluateAsync(`
+    /* tv-mcp:list-scripts */
+    fetch('https://pine-facade.tradingview.com/pine-facade/list/?filter=saved', { credentials: 'include' })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (!Array.isArray(data)) return { error: 'pine-facade returned unexpected data' };
+        return { scripts: data.map(function(s) {
+          return { scriptIdPart: s.scriptIdPart, scriptName: s.scriptName, scriptTitle: s.scriptTitle, version: s.version };
+        }) };
+      })
+      .catch(function(e) { return { error: e.message }; })
+  `);
+  if (list?.error) throw new Error(list.error);
+
+  const record = pickScriptRecord(list?.scripts || [], name);
+  if (!record) {
+    throw new Error(`Script "${name}" not found. Use pine_list_scripts to see available scripts.`);
+  }
+
+  // Switch the editor via its own facade (what TradingView's script-name
+  // dropdown calls). Fetching the source and setValue()-ing it into the
+  // current tab — the old implementation — never switched the editor, so a
+  // later pine_set_source + save wrote into whatever script was open.
+  const opened = await deps.evaluateAsync(`
+    (function() { /* tv-mcp:open-script */
+      var parts = ${FIND_EDITOR_PARTS};
+      if (!parts) return Promise.resolve({ error: 'Pine editor facade not found — is the Pine Editor open and its script-title button visible?' });
+      var record = ${JSON.stringify({
+        scriptIdPart: record.scriptIdPart,
+        scriptName: record.scriptName,
+        scriptTitle: record.scriptTitle,
+        version: record.version,
+      })};
+      return Promise.resolve(parts.facade.openScript(record))
+        .then(function() { return { ok: true }; })
+        .catch(function(e) { return { error: e && e.message ? e.message : String(e) }; });
+    })()
+  `);
+  if (opened?.error) throw new Error(opened.error);
+
+  // facade.openScript falls back to opening a NEW DRAFT when the load fails,
+  // so success is only what the editor's own state says it is: poll until the
+  // active script id matches the requested one.
+  let active = null;
+  for (let i = 0; i < 25; i++) {
+    active = await getActiveScript(deps);
+    if (active?.script_id === record.scriptIdPart) break;
+    await deps.delay(400);
+  }
+  if (active?.script_id !== record.scriptIdPart) {
+    lastOpenTarget = null;
+    throw new Error(
+      `Editor did not switch to "${record.scriptName}" (${record.scriptIdPart}) — it shows ` +
+      `${active ? `"${active.script_name}" (${active.script_id || 'unsaved draft'})` : 'no readable script state'}. ` +
+      'Not safe to write; retry pine_open.'
+    );
+  }
+
+  const lineCount = await deps.evaluate(`
+    (function() { /* tv-mcp:line-count */
+      var m = ${FIND_MONACO};
+      if (!m) return null;
+      var model = m.editor.getModel();
+      return model ? model.getLineCount() : null;
+    })()
+  `);
+
+  lastOpenTarget = {
+    scriptIdPart: record.scriptIdPart,
+    name: record.scriptName || record.scriptTitle,
+    draft: false,
+  };
+
+  return {
+    success: true,
+    name: record.scriptName || record.scriptTitle,
+    script_id: record.scriptIdPart,
+    version: record.version ?? null,
+    lines: lineCount ?? undefined,
+    editor_title: active.editor_title,
+    opened: true,
+    verified: true,
+    source: 'editor_facade',
+  };
 }
 
 export async function listScripts() {

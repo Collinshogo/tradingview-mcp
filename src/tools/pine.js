@@ -8,7 +8,7 @@ export function registerPineTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_set_source', 'Set Pine Script source code in the editor', {
+  server.tool('pine_set_source', 'Set Pine Script source code in the editor. Refuses to write if the editor is showing a different script than the last pine_open/pine_new target (prevents cross-script clobber).', {
     source: z.string().describe('Pine Script source code to inject'),
   }, async ({ source }) => {
     try { return jsonResult(await core.setSource({ source })); }
@@ -40,18 +40,18 @@ export function registerPineTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_new', 'Create a new blank Pine Script', {
+  server.tool('pine_new', 'Create a new Pine Script draft via the editor\'s own create-new flow. Verifies the editor lands on an untitled draft before reporting success. Discards any unsaved edits in the editor (like TradingView itself).', {
     type: z.enum(['indicator', 'strategy', 'library']).describe('Type of script to create'),
   }, async ({ type }) => {
     try { return jsonResult(await core.newScript({ type })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_open', 'Open a saved Pine Script by name', {
+  server.tool('pine_open', 'Open a saved Pine Script by name — actually switches the visible editor to that script (verified against the editor\'s own state). Discards any unsaved edits in the editor (like TradingView itself).', {
     name: z.string().describe('Name of the saved script to open (case-insensitive match)'),
   }, async ({ name }) => {
     try { return jsonResult(await core.openScript({ name })); }
-    catch (err) { return jsonResult({ success: false, source: 'internal_api', error: err.message }, true); }
+    catch (err) { return jsonResult({ success: false, source: 'editor_facade', error: err.message }, true); }
   });
 
   server.tool('pine_list_scripts', 'List saved Pine Scripts', {}, async () => {
