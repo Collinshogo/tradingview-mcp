@@ -18,13 +18,13 @@ export function registerDataTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('data_get_strategy_results', 'Get strategy performance metrics from Strategy Tester. Auto-opens the panel and auto-unhides a hidden strategy (TradingView never computes reports for hidden strategies); result includes unhidden_strategies when that happened.', {}, async () => {
+  server.tool('data_get_strategy_results', 'Get strategy performance metrics from Strategy Tester. Detects Deep Backtesting mode (custom date range, "DEEP" badge) and returns the deep report when one is computed — report_type says which report was read ("deep" or "standard"); deep results include date_range. Auto-opens the panel and auto-unhides a hidden strategy (TradingView never computes reports for hidden strategies); result includes unhidden_strategies when that happened.', {}, async () => {
     try { return jsonResult(await core.getStrategyResults()); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('data_get_trades', 'Get trade list from Strategy Tester. Auto-opens the panel and auto-unhides a hidden strategy.', {
-    max_trades: z.coerce.number().optional().describe('Maximum trades to return'),
+  server.tool('data_get_trades', 'Get trade list from Strategy Tester. Returns round-trip trades with entry/exit timestamps and prices (trade_format "round_trip"); reads the Deep Backtesting report when deep mode is active (report_type "deep"/"standard"). Falls back to the raw order list (trade_format "orders") when the panel UI is unavailable. Auto-opens the panel and auto-unhides a hidden strategy.', {
+    max_trades: z.coerce.number().optional().describe('Maximum trades to return (default 20, max 200)'),
   }, async ({ max_trades }) => {
     try { return jsonResult(await core.getTrades({ max_trades })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }

@@ -5,7 +5,8 @@ import { evaluate, evaluateAsync, KNOWN_PATHS, safeString } from '../connection.
 import { waitForChartReady } from '../wait.js';
 
 const MAX_OHLCV_BARS = 500;
-const MAX_TRADES = 20;
+const MAX_TRADES = 200;
+const DEFAULT_TRADES = 20;
 
 // Round to 8 dp — enough to kill float noise (29899.999999997 → 29900) without
 // destroying precision on forex/crypto prices. The old 2-dp rounding flattened
@@ -80,6 +81,89 @@ const FIND_STRATEGY_JS = `
       } catch (e) {}
     }
     return unhidden;
+  }
+`;
+
+// Deep Backtesting ("DEEP" badge, custom date range) computes its report on a
+// separate backend (WebSocket to window.WEBSOCKET_HOST_FOR_DEEP_BACKTESTING)
+// and stores it OUTSIDE the chart study: the Strategy Tester panel owns a
+// BacktestingStrategyFacade whose _deepBacktestingManager keeps the deep
+// report in a WatchedValue. The study's reportData() keeps the last shallow
+// chart-range report, so reading only reportData() while deep mode is active
+// silently returns stale shallow numbers. These helpers locate the facade —
+// it is passed as a prop into the panel's React tree — and read the mode
+// flag, the deep report, and the facade's normalized chart report (which,
+// unlike ordersData(), carries round-trip trades with entry/exit timestamps).
+const DEEP_BACKTESTING_JS = `
+  function findBacktestingFacade() {
+    try {
+      var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
+      if (!bwb) return null;
+      var w = null;
+      try { if (typeof bwb.getWidgetByName === 'function') w = bwb.getWidgetByName('backtesting'); } catch (e) {}
+      if (!w && bwb._widgets) w = bwb._widgets['backtesting'];
+      var c = w && w._container;
+      if (!c || typeof c.querySelectorAll !== 'function') return null;
+      var fiber = null;
+      var els = c.querySelectorAll('*');
+      for (var i = 0; i < els.length && !fiber; i++) {
+        var ks = Object.keys(els[i]);
+        for (var j = 0; j < ks.length; j++) {
+          if (ks[j].indexOf('__reactFiber$') === 0 || ks[j].indexOf('__reactContainer$') === 0) { fiber = els[i][ks[j]]; break; }
+        }
+      }
+      if (!fiber) return null;
+      var root = fiber, hops = 0;
+      while (root.return && hops < 500) { root = root.return; hops++; }
+      var seen = new Set(), queue = [root], count = 0;
+      while (queue.length && count < 5000) {
+        var f = queue.shift(); count++;
+        if (!f || seen.has(f)) continue;
+        seen.add(f);
+        var p = f.memoizedProps;
+        if (p && typeof p === 'object') {
+          var pk = Object.keys(p);
+          for (var q = 0; q < pk.length && q < 30; q++) {
+            var v = null;
+            try { v = p[pk[q]]; } catch (e) {}
+            if (v && typeof v === 'object' && v._deepBacktestingManager && typeof v._deepBacktestingManager === 'object') return v;
+          }
+        }
+        if (f.child) queue.push(f.child);
+        if (f.sibling) queue.push(f.sibling);
+      }
+      return null;
+    } catch (e) { return null; }
+  }
+  // status_type: 1 = loading, 2 = completed, 3 = error, null = never requested.
+  function readDeepState() {
+    var facade = findBacktestingFacade();
+    if (!facade) return { facade_found: false, deep_active: false, report: null, chart_report: null, status_type: null, active_name: null };
+    var report = null, statusType = null, active = null, chartReport = null;
+    try { report = facade._deepBacktestingManager._reportDataDeepBacktesting.value(); } catch (e) {}
+    try { var st = facade._deepBacktestingManager._statusDeepBacktesting.value(); statusType = st ? st.type : null; } catch (e) {}
+    try { active = facade._activeStrategy.value(); } catch (e) {}
+    try { chartReport = facade._reportData.value(); } catch (e) {}
+    var name = null;
+    if (active) {
+      // Prefer the chart source's full description over the facade's shortDescription.
+      try {
+        var strategies = findStrategies();
+        for (var i = 0; i < strategies.length; i++) {
+          try { if (strategies[i].s.id() === active.id && strategies[i].name) { name = strategies[i].name; break; } } catch (e) {}
+        }
+      } catch (e) {}
+      if (!name) name = active.shortDescription || null;
+    }
+    return { facade_found: true, deep_active: !!facade._isDeepBacktesting, report: report, chart_report: chartReport, status_type: statusType, active_name: name };
+  }
+  function deepStatusLabel(statusType) {
+    return statusType === 1 ? 'loading' : (statusType === 3 ? 'error' : 'not-generated');
+  }
+  function deepPendingWarning(statusType, what) {
+    return 'Deep Backtesting mode is ON but the deep report is not available (' + deepStatusLabel(statusType) + '). ' +
+           what + ' below are from the STANDARD chart-range report and do NOT cover the deep date range. ' +
+           'Generate the report in the Strategy Tester panel and retry.';
   }
 `;
 
@@ -230,7 +314,16 @@ async function ensureStrategyTesterReady(maxWaitMs = 6000) {
     const ready = await evaluate(`
       (function() {
         ${FIND_STRATEGY_JS}
+        ${DEEP_BACKTESTING_JS}
         var f = findStrategy();
+        var deep = readDeepState();
+        if (deep.deep_active) {
+          // In deep mode, wait for the deep report (a generate request may be in
+          // flight after the panel opens). If no request is running there is
+          // nothing to wait for — proceed and let the caller see the warning.
+          if (deep.report && deep.report.performance) return 'ready';
+          return deep.status_type === 1 ? 'pending' : 'ready';
+        }
         if (!f) return 'no-strategy';
         return f.report && f.report.performance ? 'ready' : 'pending';
       })()
@@ -241,19 +334,46 @@ async function ensureStrategyTesterReady(maxWaitMs = 6000) {
   return { status, unhidden: unhidden || [] };
 }
 
-export async function getStrategyResults() {
-  const ready = await ensureStrategyTesterReady();
-  const results = await evaluate(`
+// Exported for tests: the exact page-context script getStrategyResults evaluates.
+export function buildStrategyResultsJS() {
+  return `
     (function() {
       ${FIND_STRATEGY_JS}
+      ${DEEP_BACKTESTING_JS}
       try {
         var found = findStrategy();
-        if (!found) return {metrics: {}, source: 'internal_api', error: 'No strategy found on chart. Add a strategy first (e.g. indicator_add with a "... Strategy" script).'};
-        var rd = found.report;
-        if (!rd || !rd.performance) return {metrics: {}, source: 'internal_api', error: 'Strategy report not computed yet. Retry in a few seconds; if it persists, check the Strategy Tester panel is open (ui_open_panel strategy-tester) and the strategy is not hidden on the chart.'};
+        var deep = readDeepState();
+        var haveDeepReport = deep.deep_active && deep.report && deep.report.performance;
+        if (!found && !haveDeepReport) return {metrics: {}, source: 'internal_api', report_type: null, error: 'No strategy found on chart. Add a strategy first (e.g. indicator_add with a "... Strategy" script).'};
+        var rd, reportType;
+        var extra = {};
+        if (haveDeepReport) {
+          rd = deep.report;
+          reportType = 'deep';
+          try {
+            var b = rd.settings && rd.settings.dateRange && rd.settings.dateRange.backtest;
+            if (b && b.from != null && b.to != null) extra.date_range = { from: new Date(b.from).toISOString().slice(0, 10), to: new Date(b.to).toISOString().slice(0, 10) };
+          } catch (e) {}
+        } else {
+          rd = found ? found.report : null;
+          reportType = 'standard';
+          if (deep.deep_active) {
+            extra.deep_mode_active = true;
+            extra.deep_status = deepStatusLabel(deep.status_type);
+            extra.warning = deepPendingWarning(deep.status_type, 'Metrics');
+          }
+        }
+        if (!rd || !rd.performance) {
+          var err = {metrics: {}, source: 'internal_api', report_type: null, error: 'Strategy report not computed yet. Retry in a few seconds; if it persists, check the Strategy Tester panel is open (ui_open_panel strategy-tester) and the strategy is not hidden on the chart.'};
+          for (var ek in extra) err[ek] = extra[ek];
+          return err;
+        }
         var perf = rd.performance;
         var all = perf.all || {};
         // Headline metrics, named to match the Strategy Tester "Key stats".
+        // The deep report (fromStudyReportToBacktestingReport) and the raw
+        // study report use the same performance key names, so one extraction
+        // serves both.
         var metrics = {
           net_profit: all.netProfit,
           net_profit_percent: all.netProfitPercent,
@@ -262,7 +382,7 @@ export async function getStrategyResults() {
           profit_factor: all.profitFactor,
           max_drawdown: perf.maxStrategyDrawDown,
           max_drawdown_percent: perf.maxStrategyDrawDownPercent,
-          total_trades: (all.numberOfWiningTrades || 0) + (all.numberOfLosingTrades || 0),
+          total_trades: (typeof all.totalTrades === 'number') ? all.totalTrades : (all.numberOfWiningTrades || 0) + (all.numberOfLosingTrades || 0),
           winning_trades: all.numberOfWiningTrades,
           losing_trades: all.numberOfLosingTrades,
           percent_profitable: all.percentProfitable,
@@ -277,42 +397,101 @@ export async function getStrategyResults() {
         };
         var clean = {};
         for (var k in metrics) { if (metrics[k] !== null && metrics[k] !== undefined) clean[k] = metrics[k]; }
-        var currency = rd.currency || null;
-        return {metrics: clean, currency: currency, strategy: found.name, source: 'internal_api'};
-      } catch(e) { return {metrics: {}, source: 'internal_api', error: e.message}; }
+        var name = reportType === 'deep' ? (deep.active_name || (found && found.name) || null) : ((found && found.name) || null);
+        var res = {metrics: clean, currency: rd.currency || null, strategy: name, report_type: reportType, source: 'internal_api'};
+        for (var xk in extra) res[xk] = extra[xk];
+        return res;
+      } catch(e) { return {metrics: {}, source: 'internal_api', report_type: null, error: e.message}; }
     })()
-  `);
+  `;
+}
+
+export async function getStrategyResults() {
+  const ready = await ensureStrategyTesterReady();
+  const results = await evaluate(buildStrategyResultsJS());
   return {
     success: Object.keys(results?.metrics || {}).length > 0,
     metric_count: Object.keys(results?.metrics || {}).length,
     strategy: results?.strategy, currency: results?.currency, source: results?.source,
+    report_type: results?.report_type ?? null,
+    ...(results?.date_range && { date_range: results.date_range }),
+    ...(results?.deep_mode_active && { deep_mode_active: true, deep_status: results.deep_status, warning: results.warning }),
     metrics: results?.metrics || {},
     ...(ready.unhidden.length && { unhidden_strategies: ready.unhidden, note: 'Strategy was hidden on the chart; it was made visible so the report could compute.' }),
     error: results?.error,
   };
 }
 
-export async function getTrades({ max_trades } = {}) {
-  const limit = Math.min(max_trades || 20, MAX_TRADES);
-  const ready = await ensureStrategyTesterReady();
-  const trades = await evaluate(`
+// Exported for tests: the exact page-context script getTrades evaluates.
+export function buildTradesJS(limit) {
+  return `
     (function() {
       ${FIND_STRATEGY_JS}
+      ${DEEP_BACKTESTING_JS}
       try {
         var found = findStrategy();
+        var deep = readDeepState();
+        // Prefer the facade's normalized reports: round-trip trades with real
+        // entry/exit timestamps and prices. Deep report when deep mode is on,
+        // else the chart report (same shape).
+        var rd = null, reportType = null;
+        if (deep.deep_active && deep.report && Array.isArray(deep.report.trades)) {
+          rd = deep.report; reportType = 'deep';
+        } else if (deep.facade_found && deep.chart_report && Array.isArray(deep.chart_report.trades)) {
+          rd = deep.chart_report; reportType = 'standard';
+        }
+        var extra = {};
+        if (deep.deep_active && reportType !== 'deep') {
+          extra.deep_mode_active = true;
+          extra.deep_status = deepStatusLabel(deep.status_type);
+          extra.warning = deepPendingWarning(deep.status_type, 'Trades');
+        }
+        if (rd) {
+          var trades = rd.trades;
+          var total = trades.length;
+          // Return the most RECENT trades (tail) — that's what a trader wants to see.
+          var start = Math.max(0, total - ${limit});
+          var result = [];
+          for (var t = start; t < total; t++) {
+            var tr = trades[t] || {};
+            var en = tr.entry || {};
+            var ex = tr.exit || {};
+            result.push({
+              trade_number: tr.tradeNumber,
+              side: (en.type && en.type.charAt(0) === 's') ? 'short' : 'long',
+              qty: tr.quantity,
+              entry_time: en.time != null ? new Date(en.time).toISOString() : null,
+              entry_price: en.price != null ? en.price : null,
+              exit_time: ex.time != null ? new Date(ex.time).toISOString() : null,
+              exit_price: ex.price != null ? ex.price : null,
+              profit: tr.profit ? tr.profit.value : null,
+              cumulative_profit: tr.cumulativeProfit ? tr.cumulativeProfit.value : null
+            });
+          }
+          var res = {trades: result, total_trades: total, trade_format: 'round_trip', report_type: reportType, source: 'internal_api'};
+          for (var xk in extra) res[xk] = extra[xk];
+          return res;
+        }
+        // Fallback: raw order list from the study (panel UI not mounted, or
+        // older TradingView build without the facade). No timestamps — only
+        // bar time_index.
         if (!found) return {trades: [], source: 'internal_api', error: 'No strategy found on chart.'};
         var strat = found.strat;
         var orders = strat.ordersData(); if (orders && typeof orders.value === 'function') orders = orders.value();
-        if (!orders || !Array.isArray(orders)) return {trades: [], source: 'internal_api', total_orders: 0, error: 'Strategy orders not computed yet. Open the Strategy Tester panel (ui_open_panel strategy-tester) and retry.'};
-        var total = orders.length;
+        if (!orders || !Array.isArray(orders)) {
+          var err = {trades: [], source: 'internal_api', total_orders: 0, error: 'Strategy orders not computed yet. Open the Strategy Tester panel (ui_open_panel strategy-tester) and retry.'};
+          for (var ek in extra) err[ek] = extra[ek];
+          return err;
+        }
+        var totalOrders = orders.length;
         // Return the most RECENT orders (tail) — that's what a trader wants to see.
-        var start = Math.max(0, total - ${limit});
-        var result = [];
-        for (var t = start; t < total; t++) {
-          var o = orders[t];
+        var ostart = Math.max(0, totalOrders - ${limit});
+        var oresult = [];
+        for (var oi = ostart; oi < totalOrders; oi++) {
+          var o = orders[oi];
           if (typeof o === 'object' && o !== null) {
             // Map TradingView's terse order keys to readable names.
-            result.push({
+            oresult.push({
               id: o.id,
               type: o.tp,
               side: o.b ? 'buy' : 'sell',
@@ -323,13 +502,26 @@ export async function getTrades({ max_trades } = {}) {
             });
           }
         }
-        return {trades: result, total_orders: total, source: 'internal_api'};
+        var ores = {trades: oresult, total_orders: totalOrders, trade_format: 'orders', report_type: 'standard', source: 'internal_api'};
+        for (var ok in extra) ores[ok] = extra[ok];
+        return ores;
       } catch(e) { return {trades: [], source: 'internal_api', error: e.message}; }
     })()
-  `);
+  `;
+}
+
+export async function getTrades({ max_trades } = {}) {
+  const limit = Math.min(max_trades || DEFAULT_TRADES, MAX_TRADES);
+  const ready = await ensureStrategyTesterReady();
+  const trades = await evaluate(buildTradesJS(limit));
   return {
     success: (trades?.trades?.length || 0) > 0,
-    trade_count: trades?.trades?.length || 0, total_orders: trades?.total_orders ?? 0,
+    trade_count: trades?.trades?.length || 0,
+    ...(trades?.total_trades != null && { total_trades: trades.total_trades }),
+    ...(trades?.total_orders != null && { total_orders: trades.total_orders }),
+    report_type: trades?.report_type ?? null,
+    ...(trades?.trade_format && { trade_format: trades.trade_format }),
+    ...(trades?.deep_mode_active && { deep_mode_active: true, deep_status: trades.deep_status, warning: trades.warning }),
     source: trades?.source, trades: trades?.trades || [],
     ...(ready.unhidden.length && { unhidden_strategies: ready.unhidden, note: 'Strategy was hidden on the chart; it was made visible so orders could compute.' }),
     error: trades?.error,
