@@ -132,23 +132,37 @@ async function clickDay(iso) {
   );
 }
 
-// Pick one date on the field's calendar: focus field -> nav to month -> click day.
+// Pick one date on the field's calendar: focus field -> nav to month -> click
+// day. The month nav is CONSTRAINED by the other field's committed value (the
+// end calendar can't go before the start month and vice versa) — a stuck
+// header means the caller must set the other field first.
 async function pickDate(idx, iso) {
   const [y, m] = iso.split('-').map(Number);
   const targetYM = y * 12 + (m - 1);
   const focused = await focusDateField(idx);
   if (!focused) return { ok: false, why: 'dialog not open' };
   await delay(400);
-  for (let hop = 0; hop < 30; hop++) {
+  let atTarget = false;
+  let lastHdr = null;
+  let stuck = 0;
+  for (let hop = 0; hop < 40; hop++) {
     const hdr = await readCalHeader();
     if (!hdr) return { ok: false, why: 'calendar header not found' };
     const [mn, yr] = hdr.split(' ');
     const curYM = Number(yr) * 12 + MONTHS_FULL.indexOf(mn);
-    if (curYM === targetYM) break;
+    if (curYM === targetYM) { atTarget = true; break; }
+    if (hdr === lastHdr) {
+      stuck += 1;
+      if (stuck >= 3) return { ok: false, why: 'month nav stuck at ' + hdr + ' (range constraint — set the other field first)' };
+    } else {
+      stuck = 0;
+    }
+    lastHdr = hdr;
     const nav = await clickMonthNav(targetYM < curYM ? -1 : 1);
     if (!nav) return { ok: false, why: 'month nav button not found' };
     await delay(250);
   }
+  if (!atTarget) return { ok: false, why: 'month nav did not reach target' };
   const day = await clickDay(iso);
   if (!day) return { ok: false, why: 'day cell not found for ' + iso };
   await delay(400);
@@ -168,11 +182,18 @@ async function clickSelect() {
 }
 
 async function setRangeAndSelect(from, to) {
-  // end field first (lesson: committing start can re-render/clamp the end field)
-  let r = await pickDate(1, to);
-  if (!r.ok) return { ok: false, why: 'end: ' + r.why };
-  r = await pickDate(0, from);
-  if (!r.ok) return { ok: false, why: 'start: ' + r.why };
+  // Adaptive order: each field's calendar is clamped by the OTHER field's
+  // committed value, so moving the range EARLIER needs start-first and LATER
+  // needs end-first. Try start-first, flip on a jam.
+  let a = await pickDate(0, from);
+  let b = a.ok ? await pickDate(1, to) : { ok: false, why: 'skipped (start failed)' };
+  if (!(a.ok && b.ok)) {
+    const b2 = await pickDate(1, to);
+    const a2 = b2.ok ? await pickDate(0, from) : { ok: false, why: 'skipped (end failed)' };
+    if (!(a2.ok && b2.ok)) {
+      return { ok: false, why: 'start-first: ' + (a.why || b.why) + ' | end-first: ' + (b2.why || a2.why) };
+    }
+  }
   const vals = await evaluate(READ_DATES_JS);
   if (!vals || vals[0] !== from || vals[1] !== to) {
     return { ok: false, why: 'field values wrong after day clicks', v0: vals && vals[0], v1: vals && vals[1] };
@@ -200,28 +221,27 @@ async function clickUpdateReportIfStale() {
 }
 
 async function removeStrategyStudies() {
-  // Remove every study whose main-series report exists (i.e. it is a strategy),
-  // leaving plain indicators untouched — enforces one-strategy-at-a-time.
+  // Remove every strategy study, leaving plain indicators untouched — enforces
+  // one-strategy-at-a-time (the tester reads the SELECTED strategy; extra
+  // strategies make that selection ambiguous). Strategy detection matches
+  // data.js: metaInfo().isTVScriptStrategy / is_strategy + reportData fn.
+  // Model path is CHART_API._chartWidget.model().model() (cw.model() is NOT
+  // a function on this build); removal is cw.removeEntity(id).
   return evaluate(`
     (function() {
       try {
         var cw = window.TradingViewApi._activeChartWidgetWV.value();
-        var studies = cw.getAllStudies();
+        var sources = cw._chartWidget.model().model().dataSources();
+        var doomed = [];
+        for (var i = 0; i < sources.length; i++) {
+          var s = sources[i], mi = null;
+          try { mi = s.metaInfo ? s.metaInfo() : null; } catch (e) {}
+          var isStrat = mi && (mi.isTVScriptStrategy || mi.is_strategy) && typeof s.reportData === 'function';
+          if (isStrat) { try { doomed.push({ id: s.id(), name: mi.description }); } catch (e) {} }
+        }
         var removed = [];
-        for (var i = 0; i < studies.length; i++) {
-          var st = studies[i];
-          try {
-            var model = cw.model().model();
-            var src = model.dataSourceForId(st.id);
-            var isStrat = src && typeof src.reportData === 'function';
-            if (!isStrat && src && src.metaInfo && src.metaInfo()) {
-              isStrat = !!(src.metaInfo().isTVScriptStrategy || /strategy/i.test(src.metaInfo().shortDescription === undefined ? '' : ''));
-            }
-            if (src && typeof src.reportData === 'function') {
-              cw.removeEntity(st.id);
-              removed.push(st.name);
-            }
-          } catch (e) { /* per-study best effort */ }
+        for (var j = 0; j < doomed.length; j++) {
+          try { cw.removeEntity(doomed[j].id); removed.push(doomed[j].name); } catch (e) {}
         }
         return { removed: removed };
       } catch (e) { return { error: e.message }; }
@@ -229,14 +249,35 @@ async function removeStrategyStudies() {
   `);
 }
 
-async function clickAddToChart() {
+async function closeDialogIfOpen() {
+  // A failed arm round can leave the Backtesting-dates dialog open; the next
+  // chip click would then land under it. Cancel closes without applying.
   return evaluate(`
     (function() {
-      var b = document.querySelector('[data-qa-id="add-script-to-chart"]');
-      if (b && b.offsetParent !== null) { b.click(); return true; }
+      var btns = document.querySelectorAll('button');
+      for (var i = 0; i < btns.length; i++) {
+        if ((btns[i].textContent || '').trim() === 'Cancel' && btns[i].offsetParent !== null) { btns[i].click(); return true; }
+      }
       return false;
     })()
   `);
+}
+
+async function clickAddToChart() {
+  // The button re-renders around saves and reads "Update on chart" when the
+  // script is already applied — retry briefly and accept either form.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const clicked = await evaluate(`
+      (function() {
+        var b = document.querySelector('[data-qa-id="add-script-to-chart"]') || document.querySelector('[data-qa-id="update-script-to-chart"]');
+        if (b && b.offsetParent !== null) { b.click(); return true; }
+        return false;
+      })()
+    `);
+    if (clicked) return true;
+    await delay(800);
+  }
+  return false;
 }
 
 // ── publishFile ─────────────────────────────────────────────────────────────
@@ -244,14 +285,23 @@ async function clickAddToChart() {
 export async function publishFile({ path, name }) {
   const source = readFileSync(path, 'utf8');
   const lineCount = source.split('\n').length;
+  // the save-name dialog prefills from the script title — creation only lands
+  // under `name` when the title matches it
+  const titleMatch = source.match(/^\s*(?:strategy|indicator)\s*\(\s*(['"])((?:\\.|(?!\1).)*)\1/m);
+  const scriptTitle = titleMatch && titleMatch[2];
 
   // open-or-create by name
   let opened = null;
   let created = false;
+  let preVersion = null;
   try {
     opened = await pine.openScript({ name });
+    preVersion = opened && opened.version;
   } catch (e) {
     // not found -> create a fresh draft (indicator/strategy inferred by TV from source on save)
+    if (scriptTitle && scriptTitle !== name) {
+      return { success: false, stage: 'precheck', error: 'script title "' + scriptTitle + '" != publish name "' + name + '" — the save dialog prefills from the title, so a new script would land under the wrong name' };
+    }
     const kind = /^\s*strategy\s*\(/m.test(source) ? 'strategy' : 'indicator';
     await pine.newScript({ type: kind });
     created = true;
@@ -262,51 +312,69 @@ export async function publishFile({ path, name }) {
   if (compiled && compiled.has_errors) {
     return { success: false, stage: 'compile', errors: compiled.errors, created };
   }
-  // smartCompile clicks Pine Save; a NEW script pops the name dialog — handle it
+  // A NEW script needs the save-name dialog accepted. TV prefills it with the
+  // strategy()/indicator() title, so the source's title MUST equal `name` —
+  // pine.save() dispatches Ctrl+S and clicks the dialog's Save.
   if (created) {
     await delay(700);
-    await evaluate(`
-      (function() {
-        var inputs = document.querySelectorAll('input');
-        var nameInput = null;
-        for (var i = 0; i < inputs.length; i++) {
-          var el = inputs[i];
-          if (el.offsetParent === null || el.type === 'checkbox') continue;
-          var r = el.getBoundingClientRect();
-          if (r.y > 150 && r.y < 620) { nameInput = el; break; }
-        }
-        if (!nameInput) return false;
-        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        nameInput.focus();
-        setter.call(nameInput, ${JSON.stringify(name)});
-        nameInput.dispatchEvent(new Event('input', { bubbles: true }));
-        var btns = document.querySelectorAll('button');
-        for (var i = 0; i < btns.length; i++) {
-          var t = (btns[i].textContent || '').trim();
-          if (t === 'Save' && btns[i].offsetParent !== null && !btns[i].disabled) {
-            var r = btns[i].getBoundingClientRect();
-            if (r.y > 150 && r.y < 680) { btns[i].click(); return true; }
-          }
-        }
-        return false;
-      })()
-    `);
-    await delay(800);
+    await pine.save();
+    await delay(1500);
   }
 
-  // verify the save actually persisted server-side (lesson 9: silent-save wedge)
+  // verify the save actually persisted server-side (lesson 9: silent-save
+  // wedge). The server-side script list can lag a save — retry once.
   await delay(1200);
-  const verify = await pine.openScript({ name });
-  const persisted = verify && Math.abs((verify.lines || 0) - lineCount) <= 2;
+  let verify = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      verify = await pine.openScript({ name });
+      break;
+    } catch (e) {
+      if (attempt === 1) return { success: false, stage: 'verify', error: 'script not found after save: ' + e.message, created };
+      await delay(3000);
+    }
+  }
+  // Persistence check: openScript re-fetches the SERVER-saved source into the
+  // editor, so a Monaco readback now equals what the server holds. An
+  // unbumped version is fine when the saved text matches the file (identical
+  // republish); a mismatch is the silent-save wedge.
+  let versionOk = created || !preVersion || (verify && verify.version !== preVersion);
+  let contentOk = null;
+  if (verify && !versionOk) {
+    const norm = (s) => s.replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, '').trim();
+    try {
+      const savedSrc = await pine.getSource();
+      contentOk = norm(typeof savedSrc === 'string' ? savedSrc : (savedSrc && savedSrc.source) || '') === norm(source);
+    } catch (e) { contentOk = false; }
+    if (!contentOk) {
+      // one retry: save again and re-verify
+      await pine.save();
+      await delay(2000);
+      try { verify = await pine.openScript({ name }); } catch (e) { /* keep old verify */ }
+      versionOk = verify && verify.version !== preVersion;
+    }
+  }
+  let persisted = verify && Math.abs((verify.lines || 0) - lineCount) <= 2 && (versionOk || contentOk);
+  if (!persisted && verify && Math.abs((verify.lines || 0) - lineCount) > 2) {
+    // the server-side list can serve a stale line count right after a save —
+    // one delayed re-read before declaring a wedge
+    await delay(3500);
+    try {
+      verify = await pine.openScript({ name });
+      versionOk = created || !preVersion || (verify && verify.version !== preVersion);
+      persisted = verify && Math.abs((verify.lines || 0) - lineCount) <= 2 && (versionOk || contentOk);
+    } catch (e) { /* keep prior verdict */ }
+  }
   return {
     success: !!persisted,
     script_id: verify && verify.script_id,
     version: verify && verify.version,
+    pre_version: preVersion || undefined,
     saved_lines: verify && verify.lines,
     expected_lines: lineCount,
     created,
     warnings: compiled && compiled.errors && compiled.errors.length ? compiled.errors : undefined,
-    ...(persisted ? {} : { error: 'Save did not persist (line count mismatch) — TV save wedge; retry after a TV restart.' }),
+    ...(persisted ? {} : { error: 'Save did not persist (line-count or version check failed) — TV save wedge; retry after a TV restart.' }),
   };
 }
 
@@ -348,6 +416,8 @@ export async function deepRun({ script_name, timeframe, from, to, inputs, poll_s
   let last = null;
   let lastSet = null;
   for (let round = 0; round < 2; round++) {
+    await closeDialogIfOpen();
+    await delay(400);
     await clickTesterChip();
     await delay(700);
     await clickCustomRange();
