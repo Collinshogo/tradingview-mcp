@@ -312,6 +312,15 @@ export async function publishFile({ path, name }) {
   if (compiled && compiled.has_errors) {
     return { success: false, stage: 'compile', errors: compiled.errors, created };
   }
+  // belt-and-braces: smartCompile can miss late-surfacing syntax errors (seen
+  // 07-19 on LVL-5M "Syntax error at input") — query the editor's marker list
+  await delay(1200);
+  try {
+    const errs = await pine.getErrors();
+    const list = Array.isArray(errs) ? errs : (errs && errs.errors) || [];
+    const hard = list.filter((e) => !e.severity || /error/i.test(String(e.severity)));
+    if (hard.length) return { success: false, stage: 'compile', errors: hard.slice(0, 5), created };
+  } catch (e) { /* marker query is best-effort */ }
   // A NEW script needs the save-name dialog accepted. TV prefills it with the
   // strategy()/indicator() title, so the source's title MUST equal `name` —
   // pine.save() dispatches Ctrl+S and clicks the dialog's Save.
@@ -321,48 +330,39 @@ export async function publishFile({ path, name }) {
     await delay(1500);
   }
 
-  // verify the save actually persisted server-side (lesson 9: silent-save
-  // wedge). The server-side script list can lag a save — retry once.
-  await delay(1200);
+  // Verify the save persisted server-side (lesson 9: silent-save wedge).
+  // openScript re-fetches the SERVER-saved source into the editor, but the
+  // server list LAGS saves by seconds — poll with backoff before judging, and
+  // never fire extra saves on what is merely lag. Persistence = line count
+  // matches AND (version bumped OR saved text equals the file — the latter
+  // covers identical republishes).
+  const norm = (s) => s.replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, '').trim();
   let verify = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      verify = await pine.openScript({ name });
-      break;
-    } catch (e) {
-      if (attempt === 1) return { success: false, stage: 'verify', error: 'script not found after save: ' + e.message, created };
-      await delay(3000);
-    }
-  }
-  // Persistence check: openScript re-fetches the SERVER-saved source into the
-  // editor, so a Monaco readback now equals what the server holds. An
-  // unbumped version is fine when the saved text matches the file (identical
-  // republish); a mismatch is the silent-save wedge.
-  let versionOk = created || !preVersion || (verify && verify.version !== preVersion);
+  let versionOk = false;
   let contentOk = null;
-  if (verify && !versionOk) {
-    const norm = (s) => s.replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, '').trim();
-    try {
-      const savedSrc = await pine.getSource();
-      contentOk = norm(typeof savedSrc === 'string' ? savedSrc : (savedSrc && savedSrc.source) || '') === norm(source);
-    } catch (e) { contentOk = false; }
-    if (!contentOk) {
-      // one retry: save again and re-verify
-      await pine.save();
-      await delay(2000);
-      try { verify = await pine.openScript({ name }); } catch (e) { /* keep old verify */ }
-      versionOk = verify && verify.version !== preVersion;
+  let persisted = false;
+  for (let attempt = 0; attempt < 4 && !persisted; attempt++) {
+    await delay(attempt === 0 ? 1500 : 4000);
+    try { verify = await pine.openScript({ name }); } catch (e) { continue; }
+    versionOk = created || !preVersion || verify.version !== preVersion;
+    const linesOk = Math.abs((verify.lines || 0) - lineCount) <= 2;
+    if (linesOk && versionOk) { persisted = true; break; }
+    if (linesOk && !versionOk) {
+      try {
+        const savedSrc = await pine.getSource();
+        contentOk = norm(typeof savedSrc === 'string' ? savedSrc : (savedSrc && savedSrc.source) || '') === norm(source);
+      } catch (e) { contentOk = false; }
+      if (contentOk) { persisted = true; break; }
     }
   }
-  let persisted = verify && Math.abs((verify.lines || 0) - lineCount) <= 2 && (versionOk || contentOk);
-  if (!persisted && verify && Math.abs((verify.lines || 0) - lineCount) > 2) {
-    // the server-side list can serve a stale line count right after a save —
-    // one delayed re-read before declaring a wedge
-    await delay(3500);
+  if (!persisted && verify && contentOk === false) {
+    // genuine mismatch after polling: one retry save, one final poll
+    await pine.save();
+    await delay(3000);
     try {
       verify = await pine.openScript({ name });
-      versionOk = created || !preVersion || (verify && verify.version !== preVersion);
-      persisted = verify && Math.abs((verify.lines || 0) - lineCount) <= 2 && (versionOk || contentOk);
+      versionOk = created || !preVersion || verify.version !== preVersion;
+      persisted = Math.abs((verify.lines || 0) - lineCount) <= 2 && versionOk;
     } catch (e) { /* keep prior verdict */ }
   }
   return {
