@@ -392,18 +392,39 @@ export async function deepRun({ script_name, timeframe, from, to, inputs, poll_s
   if (!added) return { success: false, stage: 'add', error: 'Add-to-chart button not found' };
   await delay(2500);
 
-  // locate the new study id (for input overrides)
+  // Locate the new study BY THE SCRIPT NAME (an exclusion-list heuristic once
+  // matched a leftover strategy and sent the input overrides to the WRONG
+  // study — the run then silently executed on defaults).
   let entityId = null;
   const state = await chart.getState();
   if (state && state.studies) {
-    const strat = state.studies.find((s) => !['ICT', 'ATR7', 'All Fluence', 'Killzones'].some((k) => (s.name || '').includes(k)));
+    const exact = state.studies.find((s) => (s.name || '') === script_name);
+    const loose = state.studies.find((s) => (s.name || '').includes(script_name));
+    const strat = exact || loose;
     entityId = strat && strat.id;
   }
-  if (inputs && entityId) {
-    await chart.manageIndicator({ action: 'add' }).catch(() => {}); // no-op guard
+  if (inputs) {
+    if (!entityId) return { success: false, stage: 'inputs', error: 'study "' + script_name + '" not found on chart for input overrides' };
+    const wanted = typeof inputs === 'string' ? JSON.parse(inputs) : inputs;
     const { setInputs } = await import('./indicators.js');
-    await setInputs({ entity_id: entityId, inputs: typeof inputs === 'string' ? inputs : JSON.stringify(inputs) });
-    await delay(1000);
+    await setInputs({ entity_id: entityId, inputs: JSON.stringify(wanted) });
+    await delay(1200);
+    // verify the overrides actually landed on the study before burning a deep run
+    const readback = await evaluate(
+      '(function() {' +
+      '  var cw = window.TradingViewApi._activeChartWidgetWV.value();' +
+      '  var st = cw.getStudyById(' + JSON.stringify(entityId) + ');' +
+      '  if (!st) return null;' +
+      '  var iv = st.getInputValues();' +
+      '  var out = {};' +
+      '  for (var k = 0; k < iv.length; k++) out[iv[k].id] = iv[k].value;' +
+      '  return out;' +
+      '})()'
+    );
+    const mismatched = Object.keys(wanted).filter((k) => readback && String(readback[k]) !== String(wanted[k]));
+    if (!readback || mismatched.length) {
+      return { success: false, stage: 'inputs', error: 'input overrides did not apply: ' + JSON.stringify(mismatched.map((k) => ({ key: k, wanted: wanted[k], got: readback && readback[k] }))) };
+    }
   }
 
   // Arm-and-verify rounds: the picker sometimes drops the END date at Select
