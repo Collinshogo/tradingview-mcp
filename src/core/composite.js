@@ -392,16 +392,37 @@ export async function deepRun({ script_name, timeframe, from, to, inputs, poll_s
   if (!added) return { success: false, stage: 'add', error: 'Add-to-chart button not found' };
   await delay(2500);
 
-  // Locate the new study BY THE SCRIPT NAME (an exclusion-list heuristic once
-  // matched a leftover strategy and sent the input overrides to the WRONG
-  // study — the run then silently executed on defaults).
-  let entityId = null;
-  const state = await chart.getState();
-  if (state && state.studies) {
-    const exact = state.studies.find((s) => (s.name || '') === script_name);
-    const loose = state.studies.find((s) => (s.name || '').includes(script_name));
-    const strat = exact || loose;
-    entityId = strat && strat.id;
+  // Locate the study we just added. Name matching alone is fragile: the chart
+  // study is named after the script's TITLE, which often differs from the saved
+  // NAME (and can carry em-dashes/odd whitespace). Since removeStrategyStudies
+  // cleared every strategy first, the strategy study now on the chart IS ours —
+  // use that as the authority, with name matching as a cross-check only.
+  const norm = (s) => (s || '').replace(/[‒-―−]/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
+  let entityId = await evaluate(`
+    (function() {
+      try {
+        var cw = window.TradingViewApi._activeChartWidgetWV.value();
+        var sources = cw._chartWidget.model().model().dataSources();
+        var ids = [];
+        for (var i = 0; i < sources.length; i++) {
+          var s = sources[i], mi = null;
+          try { mi = s.metaInfo ? s.metaInfo() : null; } catch (e) {}
+          if (mi && (mi.isTVScriptStrategy || mi.is_strategy) && typeof s.reportData === 'function') {
+            try { ids.push(s.id()); } catch (e) {}
+          }
+        }
+        return ids.length === 1 ? ids[0] : null;
+      } catch (e) { return null; }
+    })()
+  `);
+  if (!entityId) {
+    const state = await chart.getState();
+    if (state && state.studies) {
+      const want = norm(script_name);
+      const strat = state.studies.find((s) => norm(s.name) === want)
+        || state.studies.find((s) => norm(s.name).includes(want) || want.includes(norm(s.name)));
+      entityId = strat && strat.id;
+    }
   }
   if (inputs) {
     if (!entityId) return { success: false, stage: 'inputs', error: 'study "' + script_name + '" not found on chart for input overrides' };
