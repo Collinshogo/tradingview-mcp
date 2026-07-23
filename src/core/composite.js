@@ -67,23 +67,29 @@ async function clickCustomRange() {
 // day cells are <button aria-label="Tuesday 31 March 2026"> (English locale).
 const MONTHS_FULL = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
+// The two date fields are identified by their YYYY-MM-DD value, NOT by DOM
+// position — a fresh chart / restored layout can put watchlist/search inputs
+// ahead of the dialog's, and "first two visible inputs" then reads the wrong
+// fields (cost many runs 2026-07-22). Fall back to first-two-visible only if
+// no date-formatted inputs are found (dialog mid-render).
+const DATE_FIELDS_JS =
+  'var _df=(function(){' +
+  '  var inputs=document.querySelectorAll("input");var dated=[];var vis=[];' +
+  '  for(var i=0;i<inputs.length;i++){var el=inputs[i];if(el.offsetParent===null||el.type==="checkbox")continue;vis.push(el);if(/^\\d{4}-\\d{2}-\\d{2}$/.test(el.value))dated.push(el);}' +
+  '  return dated.length>=2?dated.slice(0,2):(vis.length>=2?[vis[0],vis[1]]:null);' +
+  '})();';
+
 const READ_DATES_JS =
-  '(function() {' +
-  '  var inputs = document.querySelectorAll("input");' +
-  '  var visible = [];' +
-  '  for (var i = 0; i < inputs.length; i++) if (inputs[i].offsetParent !== null && inputs[i].type !== "checkbox") visible.push(inputs[i]);' +
-  '  if (visible.length < 2) return null;' +
-  '  return [visible[0].value, visible[1].value];' +
+  '(function() {' + DATE_FIELDS_JS +
+  '  if(!_df) return null;' +
+  '  return [_df[0].value, _df[1].value];' +
   '})()';
 
 async function focusDateField(idx) {
   return evaluate(
-    '(function() {' +
-    '  var inputs = document.querySelectorAll("input");' +
-    '  var visible = [];' +
-    '  for (var i = 0; i < inputs.length; i++) if (inputs[i].offsetParent !== null && inputs[i].type !== "checkbox") visible.push(inputs[i]);' +
-    '  if (visible.length < 2) return false;' +
-    '  visible[' + idx + '].focus(); visible[' + idx + '].click();' +
+    '(function() {' + DATE_FIELDS_JS +
+    '  if(!_df) return false;' +
+    '  _df[' + idx + '].focus(); _df[' + idx + '].click();' +
     '  return true;' +
     '})()'
   );
