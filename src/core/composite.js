@@ -10,7 +10,7 @@
  *   Outdated" banner, and stale-report polling — the 07-18 lessons 8-10).
  */
 import { readFileSync } from 'fs';
-import { evaluate } from '../connection.js';
+import { evaluate, getClient } from '../connection.js';
 import * as pine from './pine.js';
 import * as chart from './chart.js';
 import * as data from './data.js';
@@ -187,29 +187,78 @@ async function clickSelect() {
   );
 }
 
+// TYPE the date into a field via real CDP keystrokes (mouse-click to focus,
+// Ctrl+A, insertText, then Tab or Enter). Verified 2026-07-23: typed dates
+// DO commit to the picker model — the older "day-click only" belief was wrong
+// (it came from synthetic JS events, which don't). Typing jumps straight to
+// any year (2019+) in one shot; the calendar-nav path clicked "Previous month"
+// dozens of times, slipped focus to the wrong field, and jammed before 2023.
+async function typeDateField(idx, val, commitKey) {
+  const c = await getClient();
+  const pos = await evaluate(
+    '(function(){' +
+    '  var ii=document.querySelectorAll("input");var d=[];' +
+    '  for(var i=0;i<ii.length;i++)if(ii[i].offsetParent!==null&&/^\\d{4}-\\d{2}-\\d{2}$/.test(ii[i].value))d.push(ii[i]);' +
+    '  if(!d[' + idx + '])return null;var r=d[' + idx + '].getBoundingClientRect();' +
+    '  return {x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)};' +
+    '})()'
+  );
+  if (!pos) return false;
+  await c.Input.dispatchMouseEvent({ type: 'mousePressed', x: pos.x, y: pos.y, button: 'left', clickCount: 1 });
+  await c.Input.dispatchMouseEvent({ type: 'mouseReleased', x: pos.x, y: pos.y, button: 'left', clickCount: 1 });
+  await delay(180);
+  await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65 });
+  await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'a', code: 'KeyA' });
+  await delay(80);
+  await c.Input.insertText({ text: val });
+  await delay(150);
+  const kd = commitKey === 'Enter'
+    ? { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 }
+    : { type: 'keyDown', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 };
+  const ku = commitKey === 'Enter' ? { type: 'keyUp', key: 'Enter', code: 'Enter' } : { type: 'keyUp', key: 'Tab', code: 'Tab' };
+  await c.Input.dispatchKeyEvent(kd);
+  await c.Input.dispatchKeyEvent(ku);
+  await delay(300);
+  return true;
+}
+
 async function setRangeAndSelect(from, to) {
-  // Adaptive order: each field's calendar is clamped by the OTHER field's
-  // committed value, so moving the range EARLIER needs start-first and LATER
-  // needs end-first. Try start-first, flip on a jam.
-  let a = await pickDate(0, from);
-  let b = a.ok ? await pickDate(1, to) : { ok: false, why: 'skipped (start failed)' };
-  if (!(a.ok && b.ok)) {
-    const b2 = await pickDate(1, to);
-    const a2 = b2.ok ? await pickDate(0, from) : { ok: false, why: 'skipped (end failed)' };
-    if (!(a2.ok && b2.ok)) {
-      return { ok: false, why: 'start-first: ' + (a.why || b.why) + ' | end-first: ' + (b2.why || a2.why) };
+  // Type end first (Tab, keeps dialog open), then start. Reading the fields
+  // back confirms the values landed; then Select applies. Enter-on-start also
+  // submits, so if the dialog is already gone after typing start we accept it.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await typeDateField(1, to, 'Tab');
+    await delay(250);
+    await typeDateField(0, from, 'Tab');
+    await delay(300);
+    const vals = await evaluate(READ_DATES_JS);
+    if (vals === null) {
+      // dialog already closed (submitted) — treat as applied, poll verifies range
+      return { ok: true, v0: from, v1: to, note: 'submitted-on-type' };
     }
+    if (vals[0] === from && vals[1] === to) {
+      const clicked = await clickSelect();
+      if (clicked) {
+        await delay(800);
+        const still = await evaluate(READ_DATES_JS);
+        return { ok: true, v0: vals[0], v1: vals[1], note: still === null ? 'select-closed' : 'select-clicked' };
+      }
+      // Select styled-disabled — commit via Enter on the start field instead
+      await typeDateField(0, from, 'Enter');
+      await delay(800);
+      const gone = await evaluate(READ_DATES_JS);
+      if (gone === null) return { ok: true, v0: from, v1: to, note: 'enter-submitted' };
+    }
+    // values didn't land — reopen dialog and retry once
+    await closeDialogIfOpen();
+    await delay(500);
+    await clickTesterChip();
+    await delay(600);
+    await clickCustomRange();
+    await delay(600);
   }
-  const vals = await evaluate(READ_DATES_JS);
-  if (!vals || vals[0] !== from || vals[1] !== to) {
-    return { ok: false, why: 'field values wrong after day clicks', v0: vals && vals[0], v1: vals && vals[1] };
-  }
-  const clicked = await clickSelect();
-  if (!clicked) return { ok: false, why: 'Select not clickable', v0: vals[0], v1: vals[1] };
-  await delay(800);
-  // dialog must be GONE — a still-open dialog means Select silently no-oped
-  const still = await evaluate(READ_DATES_JS);
-  return { ok: still === null, v0: vals[0], v1: vals[1], why: still === null ? undefined : 'dialog still open after Select' };
+  const finalVals = await evaluate(READ_DATES_JS);
+  return { ok: false, why: 'typed dates did not stick', v0: finalVals && finalVals[0], v1: finalVals && finalVals[1] };
 }
 
 async function clickUpdateReportIfStale() {
