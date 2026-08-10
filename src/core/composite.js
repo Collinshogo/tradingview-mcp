@@ -223,20 +223,36 @@ async function typeDateField(idx, val, commitKey) {
 }
 
 async function setRangeAndSelect(from, to) {
-  // Type end first (Tab, keeps dialog open), then start. Reading the fields
-  // back confirms the values landed; then Select applies. Enter-on-start also
-  // submits, so if the dialog is already gone after typing start we accept it.
+  // ⛔ COLLIN RULING 2026-08-10 ("set the start date only and hit select — the other date is
+  // automatically set", repeated four times before it landed HERE, in the tool, where the
+  // typing actually happens): the END field is left completely untouched unless the caller
+  // asks for a SHORTER window than the dialog already shows. The dialog pre-fills the end
+  // with the last date TV can actually serve; the old code typed the caller's `to` into it
+  // first thing, and any date past the last bar (a UTC-rolled "today" being the recurring
+  // case) leaves Select DISABLED — the dialog then sits open, both retry rounds and the
+  // whole poll budget burn away, and from outside it looks like a frozen desktop. The model
+  // could never fix this from the prompt side because the typing lives here, not there.
   for (let attempt = 0; attempt < 2; attempt++) {
-    await typeDateField(1, to, 'Tab');
-    await delay(250);
+    const pre = await evaluate(READ_DATES_JS);
+    const preEnd = pre && pre[1];
+    // ISO YYYY-MM-DD compares lexicographically == chronologically. Only type the end
+    // field when the requested end is STRICTLY EARLIER than what the dialog offers
+    // (a deliberately shorter window). Requested end at-or-past the offered end means
+    // "run to the last available bar" — exactly what the untouched field already does.
+    const typeEnd = !!(preEnd && to && to < preEnd);
+    const effTo = typeEnd ? to : (preEnd || to);
+    if (typeEnd) {
+      await typeDateField(1, to, 'Tab');
+      await delay(250);
+    }
     await typeDateField(0, from, 'Tab');
     await delay(300);
     const vals = await evaluate(READ_DATES_JS);
     if (vals === null) {
       // dialog already closed (submitted) — treat as applied, poll verifies range
-      return { ok: true, v0: from, v1: to, note: 'submitted-on-type' };
+      return { ok: true, v0: from, v1: effTo, note: 'submitted-on-type' };
     }
-    if (vals[0] === from && vals[1] === to) {
+    if (vals[0] === from && (!typeEnd || vals[1] === to)) {
       const clicked = await clickSelect();
       if (clicked) {
         await delay(800);
@@ -247,7 +263,7 @@ async function setRangeAndSelect(from, to) {
       await typeDateField(0, from, 'Enter');
       await delay(800);
       const gone = await evaluate(READ_DATES_JS);
-      if (gone === null) return { ok: true, v0: from, v1: to, note: 'enter-submitted' };
+      if (gone === null) return { ok: true, v0: from, v1: vals[1], note: 'enter-submitted' };
     }
     // values didn't land — reopen dialog and retry once
     await closeDialogIfOpen();
@@ -521,6 +537,11 @@ export async function deepRun({ script_name, timeframe, from, to, inputs, poll_s
     await delay(700);
     lastSet = await setRangeAndSelect(from, to);
     if (!(lastSet && lastSet.ok)) { await delay(1000); continue; }
+    // The range actually ARMED may end earlier than the caller's nominal `to` (the
+    // set-start-only rule leaves the dialog's own last-available end in place). Verify
+    // the served report against what was armed (lastSet.v1), not the nominal ask —
+    // otherwise a successful run through the real last bar reads as a poll failure.
+    const effTo = (lastSet && lastSet.v1) || to;
 
     const deadline = Date.now() + perRoundPoll * 1000;
     while (Date.now() < deadline) {
@@ -531,9 +552,10 @@ export async function deepRun({ script_name, timeframe, from, to, inputs, poll_s
         if (
           last && last.success !== false && last.report_type === 'deep' &&
           last.date_range && last.date_range.from === from &&
-          (last.date_range.to === to || last.date_range.to === plusOneDay(to))
+          (last.date_range.to === effTo || last.date_range.to === plusOneDay(effTo) ||
+           last.date_range.to === to || last.date_range.to === plusOneDay(to))
         ) {
-          return { success: true, cleared_strategies: cleared && cleared.removed, entity_id: entityId, rounds: round + 1, ...last };
+          return { success: true, cleared_strategies: cleared && cleared.removed, entity_id: entityId, rounds: round + 1, served_to: last.date_range.to, requested_to: to, ...last };
         }
       } catch (e) { /* keep polling */ }
     }

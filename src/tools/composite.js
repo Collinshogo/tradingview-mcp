@@ -11,11 +11,11 @@ export function registerCompositeTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('strategy_deep_run', 'Run one strategy through a Deep Backtest over a date range and return fresh metrics, in one call: sets the chart timeframe, removes all OTHER strategy studies (one-strategy-at-a-time), adds the named saved script to the chart, optionally overrides inputs, arms the deep date range (end-date-first picker discipline), clicks "Update Report" whenever the outdated banner shows, and polls until a fresh deep report for the EXACT requested range is served. Replaces a ~15-call manual cycle.', {
+  server.tool('strategy_deep_run', 'Run one strategy through a Deep Backtest over a date range and return fresh metrics, in one call: sets the chart timeframe, removes all OTHER strategy studies (one-strategy-at-a-time), adds the named saved script to the chart, optionally overrides inputs, arms the deep date range (START-DATE-ONLY picker discipline, Collin 2026-08-10: the end field is left at the dialog\'s own last-available date unless `to` asks for a strictly SHORTER window — a `to` at/past the last bar can never stall the picker again), clicks "Update Report" whenever the outdated banner shows, and polls until a fresh deep report for the armed range is served (result carries served_to). Replaces a ~15-call manual cycle.', {
     script_name: z.string().describe('Saved TV script name (e.g. "AFT Gap Fade")'),
     timeframe: z.string().optional().describe('Chart timeframe first, e.g. "1", "5", "10" (minutes)'),
     from: z.string().describe('Deep range start, YYYY-MM-DD'),
-    to: z.string().describe('Deep range end, YYYY-MM-DD'),
+    to: z.string().describe('Deep range end, YYYY-MM-DD. Safe to pass any nominal end (even a future date): ends at/past the last available bar leave the dialog\'s own pre-filled last-available end untouched, so the run goes to the real last bar; only a `to` EARLIER than that is actually typed (deliberately shorter window). Check served_to in the result for the true window end.'),
     inputs: z.string().optional().describe('JSON string of input overrides applied to the fresh study before the run, e.g. \'{"in_0": "30"}\''),
     poll_seconds: z.number().optional().describe('Max seconds to wait for a fresh deep report (default 90)'),
   }, async (args) => {
