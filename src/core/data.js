@@ -3,6 +3,8 @@
  */
 import { evaluate, evaluateAsync, KNOWN_PATHS, safeString } from '../connection.js';
 import { waitForChartReady } from '../wait.js';
+import { mkdirSync, writeFileSync, lstatSync, realpathSync } from 'node:fs';
+import { dirname, extname, isAbsolute, relative, resolve } from 'node:path';
 
 const MAX_OHLCV_BARS = 500;
 const MAX_TRADES = 200;
@@ -525,6 +527,163 @@ export async function getTrades({ max_trades } = {}) {
     source: trades?.source, trades: trades?.trades || [],
     ...(ready.unhidden.length && { unhidden_strategies: ready.unhidden, note: 'Strategy was hidden on the chart; it was made visible so orders could compute.' }),
     error: trades?.error,
+  };
+}
+
+// Full List-of-Trades extraction for unattended runs. This deliberately has a
+// separate page script instead of altering buildTradesJS() or regex-rewriting
+// its generated source: the ordinary tool remains context-bounded, while this
+// path returns every round-trip from the active DEEP report and the actual
+// fired entry/exit IDs (TradingView's comment strings).
+export function buildFullTradesJS() {
+  return `
+    (function() {
+      ${FIND_STRATEGY_JS}
+      ${DEEP_BACKTESTING_JS}
+      try {
+        var deep = readDeepState();
+        if (!deep.deep_active) return {trades: [], total_trades: null, report_type: 'standard', error: 'Deep Backtesting mode is required for a complete trade export.'};
+        if (!deep.report || !Array.isArray(deep.report.trades)) return {trades: [], total_trades: null, report_type: 'deep', error: 'The DEEP report is not available yet.'};
+        var report = deep.report;
+        var source = report.trades;
+        var all = report.performance && report.performance.all;
+        if (!all || typeof all.totalTrades !== 'number') return {trades: [], total_trades: null, report_type: 'deep', error: 'The DEEP report did not provide an authoritative total trade count.'};
+        var total = all.totalTrades;
+        var result = [];
+        for (var i = 0; i < source.length; i++) {
+          var tr = source[i] || {};
+          var en = tr.entry || {};
+          var ex = tr.exit || {};
+          result.push({
+            trade_number: tr.tradeNumber,
+            side: (en.type && en.type.charAt(0) === 's') ? 'short' : 'long',
+            qty: tr.quantity,
+            entry_time_ms: en.time != null ? en.time : null,
+            exit_time_ms: ex.time != null ? ex.time : null,
+            entry_price: en.price != null ? en.price : null,
+            exit_price: ex.price != null ? ex.price : null,
+            profit: tr.profit ? tr.profit.value : null,
+            entry_signal: en.id != null ? String(en.id) : '',
+            exit_comment: ex.id != null ? String(ex.id) : ''
+          });
+        }
+        var backtest = report.settings && report.settings.dateRange && report.settings.dateRange.backtest;
+        return {
+          trades: result,
+          total_trades: total,
+          report_type: 'deep',
+          strategy: deep.active_name || null,
+          date_range: backtest && backtest.from != null && backtest.to != null
+            ? {from: new Date(backtest.from).toISOString(), to: new Date(backtest.to).toISOString()}
+            : null,
+          source: 'internal_api'
+        };
+      } catch (e) {
+        return {trades: [], total_trades: null, report_type: 'deep', error: e.message};
+      }
+    })()
+  `;
+}
+
+export const FULL_TRADE_COLUMNS = [
+  'trade_number', 'side', 'qty', 'entry_time_utc', 'exit_time_utc',
+  'entry_price', 'exit_price', 'profit_usd', 'entry_signal', 'exit_comment',
+];
+
+export function csvEscape(value) {
+  if (value === null || value === undefined) return '';
+  const text = String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function isoTime(value) {
+  if (value === null || value === undefined || value === '') return '';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) throw new Error(`Invalid trade timestamp: ${value}`);
+  return date.toISOString();
+}
+
+// Exports may only create a direct child of the repository's research/trades
+// directory. Supporting an absolute path is useful to callers, but it is
+// still checked against that one exact directory and cannot select a sibling
+// or nested path.
+export function resolveTradeExportPath(outputPath, cwd = process.cwd()) {
+  if (typeof outputPath !== 'string' || outputPath.trim() === '') throw new Error('filename is required');
+  if (extname(outputPath).toLowerCase() !== '.csv') throw new Error('Trade export filename must end in .csv');
+  const root = resolve(cwd, 'research', 'trades');
+  const candidate = resolve(root, outputPath);
+  if (dirname(candidate) !== root) throw new Error('Trade export path must be directly under process.cwd()/research/trades');
+  const rel = relative(root, candidate);
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) throw new Error('Trade export path escapes research/trades');
+  try {
+    const stat = lstatSync(candidate);
+    if (stat.isSymbolicLink()) throw new Error('Trade export target must not be a symbolic link');
+    if (realpathSync(dirname(candidate)) !== realpathSync(root)) throw new Error('Trade export directory is not the canonical research/trades directory');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  return candidate;
+}
+
+function exportDependencies(deps) {
+  return {
+    evaluate: deps?.evaluate || evaluate,
+    ensureStrategyTesterReady: deps?.ensureStrategyTesterReady || ensureStrategyTesterReady,
+    cwd: deps?.cwd || process.cwd(),
+    mkdirSync: deps?.mkdirSync || mkdirSync,
+    writeFileSync: deps?.writeFileSync || writeFileSync,
+  };
+}
+
+/**
+ * Write every trade in the active DEEP report without returning trade rows to
+ * the MCP context. The report type and exact row count are checked before any
+ * file is created, so partial/standard results cannot be mistaken for a full
+ * export.
+ */
+export async function exportTradesCsv({ filename, output_path, path, header_lines = [], _deps } = {}) {
+  const deps = exportDependencies(_deps);
+  const output = resolveTradeExportPath(filename ?? output_path ?? path, deps.cwd);
+  await deps.ensureStrategyTesterReady();
+  const report = await deps.evaluate(buildFullTradesJS());
+  if (!report || report.report_type !== 'deep') throw new Error('Trade export requires an active computed DEEP report');
+  if (!Array.isArray(report.trades)) throw new Error('DEEP report did not provide a trade list');
+  if (!Number.isInteger(report.total_trades) || report.total_trades < 0) throw new Error('DEEP report did not provide a valid total trade count');
+  if (report.trades.length !== report.total_trades) {
+    throw new Error(`Incomplete DEEP trade report: exported ${report.trades.length} of ${report.total_trades} trades`);
+  }
+  if (report.trades.length === 0) throw new Error('DEEP report contains no trades to export');
+
+  const headers = Array.isArray(header_lines) ? header_lines : [];
+  const metadata = [
+    ...headers.map((line) => `# ${String(line).replace(/[\r\n]/g, ' ')}`),
+    '# report_type=deep',
+    `# exported_at_utc=${new Date().toISOString()}`,
+  ];
+  if (report.strategy) metadata.push(`# strategy=${String(report.strategy).replace(/[\r\n]/g, ' ')}`);
+  if (report.date_range) {
+    metadata.push(`# date_range_from=${report.date_range.from}`);
+    metadata.push(`# date_range_to=${report.date_range.to}`);
+  }
+  const lines = [metadata.join('\n'), FULL_TRADE_COLUMNS.join(',')];
+  for (const trade of report.trades) {
+    if (!trade || typeof trade !== 'object') throw new Error('DEEP report contains an invalid trade row');
+    lines.push([
+      trade.trade_number, trade.side, trade.qty, isoTime(trade.entry_time_ms), isoTime(trade.exit_time_ms),
+      trade.entry_price, trade.exit_price, trade.profit,
+      trade.entry_signal ?? '', trade.exit_comment ?? '',
+    ].map(csvEscape).join(','));
+  }
+  deps.mkdirSync(resolve(deps.cwd, 'research', 'trades'), { recursive: true });
+  deps.writeFileSync(output, `${lines.join('\n')}\n`, 'utf8');
+  return {
+    success: true,
+    path: output,
+    rows: report.trades.length,
+    total_trades: report.total_trades,
+    report_type: 'deep',
+    columns: FULL_TRADE_COLUMNS,
+    date_range: report.date_range || null,
   };
 }
 

@@ -30,6 +30,15 @@ export function registerDataTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
+  server.tool('data_export_trades_csv', 'Export the complete List of Trades from the active computed DEEP Strategy Tester report to research/trades. Includes entry_signal and exit_comment from TradingView’s fired order IDs. Fails closed for standard/pending reports or incomplete row counts and returns only a compact file summary, never the trade rows.', {
+    filename: z.string().optional().describe('CSV filename directly under process.cwd()/research/trades (for example CELL123_MNQ_2026-08-30.csv)'),
+    output_path: z.string().optional().describe('Optional absolute path, accepted only when it resolves directly under process.cwd()/research/trades and ends in .csv'),
+    header_lines: z.array(z.string()).optional().describe('Optional metadata lines to write above the CSV header'),
+  }, async ({ filename, output_path, header_lines }) => {
+    try { return jsonResult(await core.exportTradesCsv({ filename, output_path, header_lines })); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
   server.tool('data_get_equity', 'Get equity curve data from Strategy Tester', {}, async () => {
     try { return jsonResult(await core.getEquity()); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
