@@ -5,12 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import {
-  withDeadline, isDeadlineExceeded, DeadlineExceeded,
+  withDeadline, isDeadlineExceeded, DeadlineExceeded, evaluate,
+  setCachedClientForTesting, getCachedClientForTesting,
 } from '../src/connection.js';
 import {
   acquireLease, withLease, runExclusive, isLeaseBusy,
 } from '../src/lease.js';
 import { runtimeIdentity } from '../src/core/health.js';
+import { waitForStudyInputs } from '../src/core/composite.js';
 
 test('withDeadline rejects a never-resolving operation with stage and timeout', async () => {
   await assert.rejects(
@@ -18,6 +20,17 @@ test('withDeadline rejects a never-resolving operation with stage and timeout', 
     (error) => error instanceof DeadlineExceeded && isDeadlineExceeded(error)
       && error.stage === 'test.evaluate' && error.timeout_ms === 20,
   );
+});
+
+test('evaluate timeout invalidates cached client and a replacement can reconnect', async () => {
+  const dead = { Runtime: { evaluate: () => new Promise(() => {}) }, close: async () => {} };
+  setCachedClientForTesting(dead);
+  await assert.rejects(evaluate('1', { timeoutMs: 20 }), (error) => isDeadlineExceeded(error));
+  assert.equal(getCachedClientForTesting(), null);
+  const replacement = { Runtime: { evaluate: async () => ({ result: { value: 42 } }) }, close: async () => {} };
+  setCachedClientForTesting(replacement);
+  assert.equal(await evaluate('1', { timeoutMs: 50 }), 42);
+  setCachedClientForTesting(null);
 });
 
 test('lease contention returns structured BUSY and stale dead owner is reclaimed', async () => {
@@ -70,6 +83,16 @@ test('token mismatch cannot release successor lease', async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
+test('a replaced local token loses re-entrant ownership and cannot continue', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tv-mcp-lost-'));
+  const lockPath = join(dir, 'lease.json');
+  const old = await acquireLease({ lockPath, busyMs: 50 });
+  await writeFile(lockPath, JSON.stringify({ token: 'successor-live', pid: process.pid, heartbeat: new Date().toISOString() }));
+  await assert.rejects(acquireLease({ lockPath, busyMs: 30 }), (error) => isLeaseBusy(error));
+  assert.equal(await old.release(), false);
+  await rm(dir, { recursive: true, force: true });
+});
+
 test('withLease always releases its token', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'tv-mcp-with-'));
   const lockPath = join(dir, 'lease.json');
@@ -118,4 +141,37 @@ test('health failure still exposes runtime identity', async () => {
   assert.equal(typeof result.mcp_pid, 'number');
   assert.ok(result.git_sha);
   assert.ok(result.loaded_core_hashes);
+});
+
+test('empty study readiness fails closed before any input write can occur', async () => {
+  let evaluations = 0;
+  const ready = await waitForStudyInputs({
+    entityId: 'study', timeoutMs: 20,
+    evaluateFn: async () => { evaluations++; return 0; },
+    delayFn: async () => {},
+  });
+  assert.equal(ready.ok, false);
+  assert.ok(evaluations > 0);
+  // deepRun only calls setInputs after waitForStudyInputs().ok is true.
+});
+
+test('exclusive process mode protects direct connection imports until owner exit', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tv-mcp-exclusive-'));
+  const lockPath = join(dir, 'lease.json');
+  const moduleUrl = new URL('../src/connection.js', import.meta.url).href;
+  const holderScript = `import { connect } from ${JSON.stringify(moduleUrl)}; try { await connect(); } catch (_) {} process.stdout.write('ready'); process.stdin.resume(); process.stdin.on('data',()=>process.exit(0));`;
+  const holder = spawn(process.execPath, ['--input-type=module', '-e', holderScript], {
+    env: { ...process.env, TV_MCP_EXCLUSIVE_PROCESS: '1', TV_MCP_LEASE_PATH: lockPath, TV_CDP_PORT: '1', TV_MCP_TIMEOUT_MS: '100', TV_MCP_CONNECT_RETRIES: '1' },
+    stdio: ['pipe', 'pipe', 'ignore'],
+  });
+  await new Promise((resolve, reject) => { holder.stdout.once('data', d => String(d).includes('ready') ? resolve() : reject(new Error('exclusive holder failed'))); holder.once('exit', code => code && reject(new Error(`holder exited ${code}`))); });
+  const contenderScript = `import { acquireLease } from ${JSON.stringify(new URL('../src/lease.js', import.meta.url).href)}; try { await acquireLease({lockPath:${JSON.stringify(lockPath)},busyMs:100}); process.stdout.write('acquired'); } catch(e) { process.stdout.write(e.code || 'error'); }`;
+  const contender = spawn(process.execPath, ['--input-type=module', '-e', contenderScript], { stdio: ['ignore', 'pipe', 'ignore'] });
+  const busy = await new Promise(resolve => { let out = ''; contender.stdout.on('data', d => out += d); contender.on('close', () => resolve(out)); });
+  assert.equal(busy, 'BUSY');
+  holder.stdin.end('release');
+  await new Promise(resolve => holder.once('close', resolve));
+  const after = await acquireLease({ lockPath, busyMs: 200 });
+  await after.release();
+  await rm(dir, { recursive: true, force: true });
 });

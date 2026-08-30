@@ -121,7 +121,11 @@ export async function manageIndicator({ action, indicator, entity_id, inputs: in
             if (byId[k]) { for (var j = 0; j < current.length; j++) { if (current[j].id === k) current[j].value = overrides[k]; } applied[k] = overrides[k]; }
             else unknown.push(k);
           }
-          study.setInputValues(current);
+          // Sparse-inputs patch: writing a full snapshot can wedge chassis
+          // input registration; write only the requested changes.
+          var sparse = [];
+          for (var s = 0; s < current.length; s++) { if (applied.hasOwnProperty(current[s].id)) sparse.push({ id: current[s].id, value: current[s].value }); }
+          if (sparse.length) study.setInputValues(sparse);
           var after = study.getInputValues();
           var confirmed = {};
           for (var m = 0; m < after.length; m++) { if (applied.hasOwnProperty(after[m].id)) confirmed[after[m].id] = after[m].value; }

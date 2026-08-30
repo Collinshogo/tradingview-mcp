@@ -150,11 +150,26 @@ async function writeLease(path, value) {
 export async function acquireLease({ operation = 'mutation', tool = operation, lockPath = LEASE_PATH,
   busyMs = DEFAULT_BUSY_MS, staleMs = DEFAULT_STALE_MS, heartbeatMs = DEFAULT_HEARTBEAT_MS } = {}) {
   if (localLease && localLease.lockPath === lockPath) {
-    localLease.owner.operation = operation;
-    localLease.owner.tool = tool;
-    localLease.owner.heartbeat = new Date().toISOString();
-    await writeLease(lockPath, localLease.owner).catch(() => {});
-    return makeHandle(localLease, heartbeatMs);
+    const current = await readLease(lockPath);
+    if (current?.token === localLease.owner.token) {
+      const nextOwner = { ...localLease.owner, operation, tool, heartbeat: new Date().toISOString() };
+      try {
+        await writeLease(lockPath, nextOwner);
+        localLease.owner = nextOwner;
+        return makeHandle(localLease, heartbeatMs);
+      } catch (error) {
+        // A replaced/deleted lock is a lost lease, never a successful
+        // re-entrant acquisition. Drop local ownership and re-enter the
+        // guarded acquisition path below.
+        const verify = await readLease(lockPath);
+        if (verify?.token === localLease.owner.token) throw error;
+        localLease = null;
+      }
+    } else {
+      // Another process replaced or removed our token. Old handles remain
+      // token-checked and cannot release the successor.
+      localLease = null;
+    }
   }
   await ensureParent(lockPath);
   const started = Date.now();

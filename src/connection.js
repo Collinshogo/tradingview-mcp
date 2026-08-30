@@ -1,4 +1,5 @@
 import CDP from 'chrome-remote-interface';
+import { acquireLease } from './lease.js';
 
 let client = null;
 let targetInfo = null;
@@ -10,6 +11,21 @@ export const CDP_PORT = Number(process.env.TV_CDP_PORT || process.env.CDP_PORT) 
 const MAX_RETRIES = Math.max(1, Number(process.env.TV_MCP_CONNECT_RETRIES || 5));
 const BASE_DELAY = 500;
 export const DEFAULT_DEADLINE_MS = Math.max(100, Number(process.env.TV_MCP_TIMEOUT_MS || process.env.TV_CDP_TIMEOUT_MS || 10000));
+export const EXCLUSIVE_PROCESS = /^(1|true|yes)$/i.test(
+  process.env.TV_MCP_EXCLUSIVE_PROCESS || process.env.TV_MCP_EXCLUSIVE_LEASE || '',
+);
+let exclusiveLeasePromise = null;
+
+async function ensureExclusiveProcessLease() {
+  if (!EXCLUSIVE_PROCESS) return;
+  if (!exclusiveLeasePromise) {
+    exclusiveLeasePromise = acquireLease({ operation: 'direct_bridge', tool: 'cdp_connection' }).catch((error) => {
+      exclusiveLeasePromise = null;
+      throw error;
+    });
+  }
+  await exclusiveLeasePromise;
+}
 
 /** Error raised when a CDP/HTTP operation outlives its deadline. */
 export class DeadlineExceeded extends Error {
@@ -62,6 +78,11 @@ function invalidateCachedClient(expected = client) {
 
 /** Explicit reset for direct bridges that detect a renderer restart. */
 export function resetCachedClient() { invalidateCachedClient(client); }
+
+// Narrow dependency-injection hooks for offline reliability tests and bridge
+// adapters. They intentionally do not expose connection internals otherwise.
+export function setCachedClientForTesting(nextClient, info = null) { client = nextClient; targetInfo = info; }
+export function getCachedClientForTesting() { return client; }
 
 function timeoutFor(opts) {
   return Math.max(1, Number(opts?.timeoutMs ?? opts?.timeout_ms ?? DEFAULT_DEADLINE_MS) || DEFAULT_DEADLINE_MS);
@@ -117,13 +138,15 @@ export function requireFinite(value, name) {
   return n;
 }
 
-export async function getClient() {
+export async function getClient(opts = {}) {
+  await ensureExclusiveProcessLease();
+  const deadline = timeoutFor(opts);
   if (client) {
     try {
       // Quick liveness check
       await withDeadline(
         () => client.Runtime.evaluate({ expression: '1', returnByValue: true }),
-        DEFAULT_DEADLINE_MS,
+        deadline,
         'cdp.liveness',
         () => invalidateCachedClient(client),
       );
@@ -137,6 +160,7 @@ export async function getClient() {
 }
 
 export async function connect(targetId = null) {
+  await ensureExclusiveProcessLease();
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
@@ -224,8 +248,9 @@ export async function getTargetInfo() {
 }
 
 export async function evaluate(expression, opts = {}) {
-  const c = await getClient();
   const { timeoutMs, timeout_ms, ...evaluateOpts } = opts;
+  const deadline = timeoutFor({ timeoutMs, timeout_ms });
+  const c = await getClient({ timeoutMs: deadline });
   const result = await withDeadline(
     () => c.Runtime.evaluate({
       expression,
@@ -233,7 +258,7 @@ export async function evaluate(expression, opts = {}) {
       awaitPromise: evaluateOpts.awaitPromise ?? false,
       ...evaluateOpts,
     }),
-    timeoutFor({ timeoutMs, timeout_ms }),
+    deadline,
     evaluateOpts.awaitPromise ? 'cdp.Runtime.evaluate.awaitPromise' : 'cdp.Runtime.evaluate',
     () => invalidateCachedClient(c),
   );

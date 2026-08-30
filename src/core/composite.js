@@ -28,6 +28,25 @@ function plusOneDay(iso) {
   return dt.toISOString().slice(0, 10);
 }
 
+/** Poll study input registration without ever writing an empty snapshot. */
+export async function waitForStudyInputs({ entityId, evaluateFn = evaluate, delayFn = delay, timeoutMs = 10000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let length = 0;
+  while (Date.now() < deadline) {
+    length = await evaluateFn(
+      '(function() {' +
+      '  var cw = window.TradingViewApi._activeChartWidgetWV.value();' +
+      '  var st = cw.getStudyById(' + JSON.stringify(entityId) + ');' +
+      '  if (!st) return 0;' +
+      '  try { return st.getInputValues().length; } catch (e) { return 0; }' +
+      '})()', { timeoutMs: Math.max(1, deadline - Date.now()) },
+    );
+    if (length > 0) return { ok: true, length };
+    await delayFn(Math.min(500, Math.max(1, deadline - Date.now())));
+  }
+  return { ok: false, length: 0 };
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 async function clickTesterChip() {
@@ -498,6 +517,12 @@ export async function deepRun({ script_name, timeframe, from, to, inputs, poll_s
   if (inputs) {
     if (!entityId) return { success: false, stage: 'inputs', error: 'study "' + script_name + '" not found on chart for input overrides' };
     const wanted = typeof inputs === 'string' ? JSON.parse(inputs) : inputs;
+    // The freshly-added study can still be compiling; avoid writing an empty
+    // input snapshot, which silently no-ops or wedges the study.
+    const ready = await waitForStudyInputs({ entityId });
+    if (!ready.ok) {
+      return { success: false, stage: 'inputs_ready', error: 'Study inputs did not become available before the readiness deadline' };
+    }
     const { setInputs } = await import('./indicators.js');
     await setInputs({ entity_id: entityId, inputs: JSON.stringify(wanted) });
     await delay(1200);

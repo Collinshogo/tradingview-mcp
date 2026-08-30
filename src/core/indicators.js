@@ -182,7 +182,11 @@ export async function setInputs({ entity_id, inputs: inputsRaw }) {
           updatedKeys[currentInputs[i].id] = overrides[currentInputs[i].id];
         }
       }
-      study.setInputValues(currentInputs);
+      // Sparse-inputs patch: write only changed entries to avoid wedging
+      // TradingView's chassis input registration on a full snapshot.
+      var sparseInputs = [];
+      for (var si = 0; si < currentInputs.length; si++) { if (updatedKeys.hasOwnProperty(currentInputs[si].id)) sparseInputs.push({ id: currentInputs[si].id, value: currentInputs[si].value }); }
+      if (sparseInputs.length) study.setInputValues(sparseInputs);
       return { updated_inputs: updatedKeys };
     })()
   `);
