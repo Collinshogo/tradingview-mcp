@@ -22,6 +22,14 @@ await runExclusive({ operation: 'publish', tool: 'pine_publish_file' }, async ()
 });
 ```
 
+An exclusive MCP server and a separate direct-bridge process are different
+owners; they intentionally cannot share one lease. The unattended runner uses
+MCP tools only and forbids direct bridge scripts while its exclusive server is
+alive. `TV_MCP_EXCLUSIVE_PROCESS=1` is still inherited by child processes as a
+fail-closed guard, so an accidental bridge returns `BUSY` instead of racing the
+server. Standalone direct bridges may use `runExclusive` when no exclusive MCP
+server owns TradingView.
+
 Read-only tools are explicitly allowlisted in `src/server.js`; tools that open
 panels or unhide studies are intentionally serialized as mutations. Unknown
 tools are serialized fail-closed. The scheduled runner may set
