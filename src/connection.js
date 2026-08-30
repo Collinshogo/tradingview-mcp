@@ -7,7 +7,7 @@ let targetInfo = null;
 // resolves to ::1 first, and Electron's --remote-debugging-port only listens on IPv4.
 export const CDP_HOST = process.env.TV_CDP_HOST || process.env.CDP_HOST || '127.0.0.1';
 export const CDP_PORT = Number(process.env.TV_CDP_PORT || process.env.CDP_PORT) || 9222;
-const MAX_RETRIES = 5;
+const MAX_RETRIES = Math.max(1, Number(process.env.TV_MCP_CONNECT_RETRIES || 5));
 const BASE_DELAY = 500;
 export const DEFAULT_DEADLINE_MS = Math.max(100, Number(process.env.TV_MCP_TIMEOUT_MS || process.env.TV_CDP_TIMEOUT_MS || 10000));
 
@@ -59,6 +59,9 @@ function invalidateCachedClient(expected = client) {
   targetInfo = null;
   try { Promise.resolve(expected.close?.()).catch(() => {}); } catch { /* already closed */ }
 }
+
+/** Explicit reset for direct bridges that detect a renderer restart. */
+export function resetCachedClient() { invalidateCachedClient(client); }
 
 function timeoutFor(opts) {
   return Math.max(1, Number(opts?.timeoutMs ?? opts?.timeout_ms ?? DEFAULT_DEADLINE_MS) || DEFAULT_DEADLINE_MS);

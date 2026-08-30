@@ -12,13 +12,20 @@ The lease records a random token, PID, server start time, operation/tool, and
 heartbeat. A busy caller receives a structured `BUSY` response after a bounded
 wait. The lease is held briefly between calls to support publish/set/save
 sequences, is heartbeated during long calls, and is only releasable by its
-token. Direct integrations should use:
+token. Direct integrations should use `runExclusive` (or its lower-level
+alias `withLease`) around the *entire* critical sequence:
 
 ```js
-import { withLease } from 'tradingview-mcp/core';
-await withLease({ operation: 'publish', tool: 'pine_publish_file' }, () => publish());
+import { runExclusive } from 'tradingview-mcp/core';
+await runExclusive({ operation: 'publish', tool: 'pine_publish_file' }, async () => {
+  await open(); await setSource(); await save(); await verifyReadback();
+});
 ```
 
-Read-only tools are explicitly allowlisted in `src/server.js`; unknown tools
-are serialized fail-closed. Do not use live TradingView E2E tests to validate
+Read-only tools are explicitly allowlisted in `src/server.js`; tools that open
+panels or unhide studies are intentionally serialized as mutations. Unknown
+tools are serialized fail-closed. The scheduled runner may set
+`TV_MCP_EXCLUSIVE_PROCESS=1` (the legacy alias `TV_MCP_EXCLUSIVE_LEASE=1` is
+also accepted) to retain ownership until process exit. Do not use live
+TradingView E2E tests to validate
 this layer; run `npm run test:unit`.

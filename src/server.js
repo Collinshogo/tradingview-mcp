@@ -24,8 +24,7 @@ import { jsonResult } from './tools/_format.js';
 const READ_ONLY_TOOLS = new Set([
   'tv_health_check', 'tv_discover', 'tv_ui_state', 'chart_get_state', 'chart_get_visible_range',
   'symbol_info', 'symbol_search', 'data_get_study_values', 'data_get_ohlcv', 'data_get_pine_lines',
-  'data_get_pine_labels', 'data_get_pine_tables', 'data_get_pine_boxes', 'data_get_strategy_results',
-  'data_get_strategy_trades', 'data_get_strategy_equity', 'data_get_strategy_depth', 'pine_get_source',
+  'data_get_pine_labels', 'data_get_pine_tables', 'data_get_pine_boxes', 'pine_get_source',
   'pine_get_errors', 'pine_get_console', 'pine_list_scripts', 'pine_analyze', 'pine_check', 'draw_list',
   'draw_get', 'replay_status', 'alert_list', 'watchlist_get', 'layout_list', 'tab_list', 'pane_list',
 ]);
@@ -34,7 +33,9 @@ let operationTail = Promise.resolve();
 let stickyHandle = null;
 let stickyTimer = null;
 const STICKY_IDLE_MS = Math.max(250, Number(process.env.TV_MCP_LEASE_IDLE_MS || 1500));
-const EXCLUSIVE_LEASE = /^(1|true|yes)$/i.test(process.env.TV_MCP_EXCLUSIVE_LEASE || '');
+const EXCLUSIVE_LEASE = /^(1|true|yes)$/i.test(
+  process.env.TV_MCP_EXCLUSIVE_PROCESS || process.env.TV_MCP_EXCLUSIVE_LEASE || '',
+);
 
 function busyResult(error) {
   const owner = error?.owner || null;

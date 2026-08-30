@@ -15,5 +15,5 @@ export * as watchlist from './watchlist.js';
 export * as indicators from './indicators.js';
 export * as ui from './ui.js';
 // Direct bridges can opt into the same cross-process mutation ownership used
-// by MCP dispatch: withLease({ operation, tool }, async () => ...).
-export { acquireLease, withLease, releaseLease, isLeaseBusy, LeaseBusyError } from '../lease.js';
+// by MCP dispatch: runExclusive({ operation, tool }, async () => ...).
+export { acquireLease, withLease, runExclusive, releaseLease, isLeaseBusy, LeaseBusyError } from '../lease.js';

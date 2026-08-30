@@ -44,6 +44,56 @@ async function readLease(path) {
   try { return JSON.parse(await fs.readFile(path, 'utf8')); } catch { return null; }
 }
 
+// Acquisition and stale recovery share this atomic directory guard. This
+// closes the read-then-reclaim race where a stale observer could otherwise
+// rename a successor lease that was created between its two operations.
+function guardPath(path) { return `${path}.acquire-guard`; }
+
+async function acquireGuard(path, busyMs, staleMs) {
+  const target = guardPath(path);
+  const started = Date.now();
+  while (Date.now() - started <= Math.max(0, Number(busyMs) || 0)) {
+    try {
+      await fs.mkdir(target);
+      return target;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      let stale = false;
+      const owner = await readLease(`${target}/owner.json`);
+      if (owner) stale = staleLease(owner, staleMs);
+      else {
+        try { stale = Date.now() - (await fs.stat(target)).mtimeMs > staleMs; } catch { /* raced */ }
+      }
+      if (stale) {
+        const moved = `${target}.stale-${token()}`;
+        try {
+          // Re-read while no contender can acquire the guard. A successor
+          // cannot appear until this guard is released.
+          const check = await readLease(`${target}/owner.json`);
+          if (!check || check.token === owner?.token) {
+            await fs.rename(target, moved);
+            await fs.rm(moved, { recursive: true, force: true });
+          }
+        } catch { /* another process won the atomic race */ }
+      }
+      if (Date.now() - started >= busyMs) return null;
+      await sleep(Math.min(50, Math.max(10, busyMs - (Date.now() - started))));
+    }
+  }
+  return null;
+}
+
+async function releaseGuard(target) { await fs.rm(target, { recursive: true, force: true }).catch(() => {}); }
+
+async function withAcquireGuard(path, busyMs, staleMs, fn) {
+  const target = await acquireGuard(path, busyMs, staleMs);
+  if (!target) return null;
+  try {
+    await fs.writeFile(`${target}/owner.json`, JSON.stringify({ token: token(), pid: process.pid, heartbeat: new Date().toISOString() }), 'utf8').catch(() => {});
+    return await fn();
+  } finally { await releaseGuard(target); }
+}
+
 function staleLease(owner, staleMs) {
   if (!owner) return true;
   const beat = Date.parse(owner.heartbeat || owner.start_time || 0);
@@ -51,7 +101,10 @@ function staleLease(owner, staleMs) {
   return old && !processAlive(owner.pid);
 }
 
-async function reclaimStale(path, owner, staleMs = DEFAULT_STALE_MS) {
+async function reclaimStale(path, owner, staleMs = DEFAULT_STALE_MS, expectedToken = owner?.token) {
+  const latest = await readLease(path);
+  if (expectedToken && (!latest || latest.token !== expectedToken)) return false;
+  owner = latest || owner;
   if (!owner) {
     // A creator briefly exposes an empty file between wx and write. Never
     // steal that live lease; only reclaim malformed content once its mtime is
@@ -63,6 +116,8 @@ async function reclaimStale(path, owner, staleMs = DEFAULT_STALE_MS) {
   } else if (!staleLease(owner, staleMs)) return false;
   const moved = `${path}.stale-${token()}`;
   try {
+    const check = await readLease(path);
+    if (expectedToken && (!check || check.token !== expectedToken)) return false;
     await fs.rename(path, moved);
     await fs.unlink(moved).catch(() => {});
     return true;
@@ -108,18 +163,24 @@ export async function acquireLease({ operation = 'mutation', tool = operation, l
     operation, tool, heartbeat: new Date().toISOString(),
   };
   while (Date.now() - started <= Math.max(0, Number(busyMs) || 0)) {
-    try {
-      const handle = await fs.open(lockPath, 'wx');
-      try { await handle.writeFile(JSON.stringify(lease), 'utf8'); } finally { await handle.close(); }
-      localLease = { lockPath, owner: lease, handles: 0, heartbeat: null };
-      return makeHandle(localLease, heartbeatMs);
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error;
-      const current = await readLease(lockPath);
-      if (await reclaimStale(lockPath, current, staleMs)) continue;
-      if (Date.now() - started >= busyMs) throw new LeaseBusyError(current, Date.now() - started);
-      await sleep(Math.min(100, Math.max(10, busyMs - (Date.now() - started))));
-    }
+    const remaining = Math.max(0, busyMs - (Date.now() - started));
+    const result = await withAcquireGuard(lockPath, remaining, staleMs, async () => {
+      try {
+        const handle = await fs.open(lockPath, 'wx');
+        try { await handle.writeFile(JSON.stringify(lease), 'utf8'); } finally { await handle.close(); }
+        localLease = { lockPath, owner: lease, handles: 0, heartbeat: null };
+        return makeHandle(localLease, heartbeatMs);
+      } catch (error) {
+        if (error?.code !== 'EEXIST') throw error;
+        const current = await readLease(lockPath);
+        if (await reclaimStale(lockPath, current, staleMs, current?.token)) return undefined;
+        return { busy: true, current };
+      }
+    });
+    if (result && !result.busy) return result;
+    const current = result?.current || await readLease(lockPath);
+    if (Date.now() - started >= busyMs) throw new LeaseBusyError(current, Date.now() - started);
+    await sleep(Math.min(50, Math.max(10, busyMs - (Date.now() - started))));
   }
   throw new LeaseBusyError(await readLease(lockPath), Date.now() - started);
 }
@@ -164,6 +225,10 @@ export async function withLease(options, fn) {
   const handle = await acquireLease(options);
   try { return await fn(handle); } finally { await handle.release(); }
 }
+
+// Explicit name for direct bridges: wrap the whole critical workflow (for
+// example open -> set source -> save -> readback), not each individual call.
+export async function runExclusive(options, fn) { return withLease(options, fn); }
 
 export async function releaseLease() {
   if (!localLease) return false;
