@@ -107,4 +107,12 @@ describe('data_export_trades_csv', () => {
     );
     assert.equal(existsSync(join(root, 'research', 'trades', 'incomplete.csv')), false);
   });
+
+  it('never overwrites an existing trade export', async () => {
+    await exportTradesCsv({ filename: 'immutable.csv', _deps: deps(report()) });
+    await assert.rejects(
+      () => exportTradesCsv({ filename: 'immutable.csv', _deps: deps(report()) }),
+      /already exists; refusing overwrite/,
+    );
+  });
 });

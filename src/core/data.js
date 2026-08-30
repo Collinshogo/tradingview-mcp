@@ -615,13 +615,6 @@ export function resolveTradeExportPath(outputPath, cwd = process.cwd()) {
   if (dirname(candidate) !== root) throw new Error('Trade export path must be directly under process.cwd()/research/trades');
   const rel = relative(root, candidate);
   if (!rel || rel.startsWith('..') || isAbsolute(rel)) throw new Error('Trade export path escapes research/trades');
-  try {
-    const stat = lstatSync(candidate);
-    if (stat.isSymbolicLink()) throw new Error('Trade export target must not be a symbolic link');
-    if (realpathSync(dirname(candidate)) !== realpathSync(root)) throw new Error('Trade export directory is not the canonical research/trades directory');
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-  }
   return candidate;
 }
 
@@ -674,8 +667,19 @@ export async function exportTradesCsv({ filename, output_path, path, header_line
       trade.entry_signal ?? '', trade.exit_comment ?? '',
     ].map(csvEscape).join(','));
   }
-  deps.mkdirSync(resolve(deps.cwd, 'research', 'trades'), { recursive: true });
-  deps.writeFileSync(output, `${lines.join('\n')}\n`, 'utf8');
+  const root = resolve(deps.cwd, 'research', 'trades');
+  deps.mkdirSync(root, { recursive: true });
+  const rootStat = lstatSync(root);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || relative(resolve(root), realpathSync(root)) !== '') {
+    throw new Error('Trade export directory must be a real directory under process.cwd(), not a link or junction');
+  }
+  try {
+    lstatSync(output);
+    throw new Error(`Trade export already exists; refusing overwrite: ${output}`);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  deps.writeFileSync(output, `${lines.join('\n')}\n`, { encoding: 'utf8', flag: 'wx' });
   return {
     success: true,
     path: output,
