@@ -15,6 +15,77 @@ import { registerUiTools } from './tools/ui.js';
 import { registerPaneTools } from './tools/pane.js';
 import { registerTabTools } from './tools/tab.js';
 import { registerCompositeTools } from './tools/composite.js';
+import { acquireLease, isLeaseBusy, releaseLease, LeaseBusyError } from './lease.js';
+import { jsonResult } from './tools/_format.js';
+
+// Reads are explicitly allowlisted. Anything not listed is serialized under
+// the cross-process lease (including newly-added tools) so a new mutator cannot
+// accidentally bypass ownership.
+const READ_ONLY_TOOLS = new Set([
+  'tv_health_check', 'tv_discover', 'tv_ui_state', 'chart_get_state', 'chart_get_visible_range',
+  'symbol_info', 'symbol_search', 'data_get_study_values', 'data_get_ohlcv', 'data_get_pine_lines',
+  'data_get_pine_labels', 'data_get_pine_tables', 'data_get_pine_boxes', 'data_get_strategy_results',
+  'data_get_strategy_trades', 'data_get_strategy_equity', 'data_get_strategy_depth', 'pine_get_source',
+  'pine_get_errors', 'pine_get_console', 'pine_list_scripts', 'pine_analyze', 'pine_check', 'draw_list',
+  'draw_get', 'replay_status', 'alert_list', 'watchlist_get', 'layout_list', 'tab_list', 'pane_list',
+]);
+
+let operationTail = Promise.resolve();
+let stickyHandle = null;
+let stickyTimer = null;
+const STICKY_IDLE_MS = Math.max(250, Number(process.env.TV_MCP_LEASE_IDLE_MS || 1500));
+const EXCLUSIVE_LEASE = /^(1|true|yes)$/i.test(process.env.TV_MCP_EXCLUSIVE_LEASE || '');
+
+function busyResult(error) {
+  const owner = error?.owner || null;
+  return jsonResult({
+    success: false, code: 'BUSY', error: error?.message || 'MCP mutation lease is busy',
+    owner: owner ? { pid: owner.pid, start_time: owner.start_time, tool: owner.tool, heartbeat: owner.heartbeat } : null,
+    waited_ms: error?.waited_ms, age_ms: error?.age_ms, retry_after_ms: error?.retry_after_ms,
+  }, true);
+}
+
+function installMutationGuard() {
+  const originalTool = server.tool.bind(server);
+  server.tool = (...args) => {
+    const handlerIndex = args.length - 1;
+    const handler = args[handlerIndex];
+    if (typeof handler !== 'function') return originalTool(...args);
+    const name = args[0];
+    args[handlerIndex] = async (...handlerArgs) => {
+      if (READ_ONLY_TOOLS.has(name)) return handler(...handlerArgs);
+      const run = operationTail.then(async () => {
+        let handle;
+        try {
+          handle = await acquireLease({ operation: 'mcp_tool', tool: name });
+        } catch (error) {
+          if (isLeaseBusy(error) || error instanceof LeaseBusyError) return busyResult(error);
+          throw error;
+        }
+        if (!stickyHandle) stickyHandle = handle;
+        clearTimeout(stickyTimer);
+        try {
+          return await handler(...handlerArgs);
+        } finally {
+          // Keep one owner lease briefly between calls so publish/set/save
+          // sequences cannot be interleaved by a second MCP process.
+          if (handle !== stickyHandle) await handle.release();
+          if (!EXCLUSIVE_LEASE) {
+            stickyTimer = setTimeout(async () => {
+              const owner = stickyHandle;
+              stickyHandle = null;
+              await owner?.release();
+            }, STICKY_IDLE_MS);
+            stickyTimer.unref?.();
+          }
+        }
+      });
+      operationTail = run.catch(() => {});
+      return run;
+    };
+    return originalTool(...args);
+  };
+}
 
 const server = new McpServer(
   {
@@ -70,6 +141,8 @@ CONTEXT MANAGEMENT:
   }
 );
 
+installMutationGuard();
+
 // Register all tool groups
 registerHealthTools(server);
 registerChartTools(server);
@@ -94,3 +167,7 @@ process.stderr.write('   Ensure your usage complies with TradingView\'s Terms of
 // Start stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);
+
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.once(signal, async () => { await releaseLease(); process.exit(0); });
+}

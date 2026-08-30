@@ -10,14 +10,13 @@
  * (Approach from issue #155 and PR #163, verified on Desktop 3.1.0.)
  */
 import CDP from 'chrome-remote-interface';
-import { getClient, reconnectTo, CDP_HOST, CDP_PORT } from '../connection.js';
+import { getClient, reconnectTo, fetchJson, withDeadline, DEFAULT_DEADLINE_MS, CDP_HOST, CDP_PORT } from '../connection.js';
 
 /**
  * List all open chart tabs (CDP page targets).
  */
 export async function list() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+  const targets = await fetchJson('/json/list', { stage: 'cdp.json.list' });
 
   // Chart tabs plus new-tab landing pages (layout picker), so every tab in the
   // top bar is listable and switchable.
@@ -41,29 +40,27 @@ export async function list() {
  * is the one whose DOM actually contains `.tabs-container .tab`.
  */
 async function withShell(fn) {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+  const targets = await fetchJson('/json/list', { stage: 'cdp.json.list' });
   const candidates = targets.filter(t => t.type === 'page' && /\/window\/index\.html/i.test(t.url || ''));
 
   for (const cand of candidates) {
     let c = null;
     try {
-      c = await CDP({ host: CDP_HOST, port: CDP_PORT, target: cand.id });
-      const probe = await c.Runtime.evaluate({
-        expression: `!!document.querySelector('.tabs-container .tab')`,
-        returnByValue: true,
-      });
+      c = await withDeadline(() => CDP({ host: CDP_HOST, port: CDP_PORT, target: cand.id }), DEFAULT_DEADLINE_MS, 'cdp.connect.tab');
+      const probe = await withDeadline(() => c.Runtime.evaluate({
+        expression: `!!document.querySelector('.tabs-container .tab')`, returnByValue: true,
+      }), DEFAULT_DEADLINE_MS, 'cdp.Runtime.evaluate.tab');
       if (probe.result?.value) {
         const out = await fn(async (expression) => {
-          const { result } = await c.Runtime.evaluate({ expression, returnByValue: true });
+          const { result } = await withDeadline(() => c.Runtime.evaluate({ expression, returnByValue: true }), DEFAULT_DEADLINE_MS, 'cdp.Runtime.evaluate.tab');
           return result?.value;
         });
-        await c.close();
+        await withDeadline(() => c.close(), DEFAULT_DEADLINE_MS, 'cdp.close.tab');
         return out;
       }
-      await c.close();
+      await withDeadline(() => c.close(), DEFAULT_DEADLINE_MS, 'cdp.close.tab');
     } catch {
-      try { if (c) await c.close(); } catch { /* already gone */ }
+      try { if (c) await withDeadline(() => c.close(), DEFAULT_DEADLINE_MS, 'cdp.close.tab'); } catch { /* already gone */ }
     }
   }
   throw new Error('TradingView shell window (tab bar) not found. Is this TradingView Desktop with tabs?');
@@ -73,20 +70,19 @@ async function withShell(fn) {
 async function isTargetVisible(targetId) {
   let c = null;
   try {
-    c = await CDP({ host: CDP_HOST, port: CDP_PORT, target: targetId });
-    const { result } = await c.Runtime.evaluate({ expression: 'document.visibilityState', returnByValue: true });
+    c = await withDeadline(() => CDP({ host: CDP_HOST, port: CDP_PORT, target: targetId }), DEFAULT_DEADLINE_MS, 'cdp.connect.tab');
+    const { result } = await withDeadline(() => c.Runtime.evaluate({ expression: 'document.visibilityState', returnByValue: true }), DEFAULT_DEADLINE_MS, 'cdp.Runtime.evaluate.tab');
     return result?.value === 'visible';
   } catch {
     return false;
   } finally {
-    try { if (c) await c.close(); } catch { /* already gone */ }
+    try { if (c) await withDeadline(() => c.close(), DEFAULT_DEADLINE_MS, 'cdp.close.tab'); } catch { /* already gone */ }
   }
 }
 
 /** Find an open new-tab landing page target (shows the layout picker). */
 async function findLandingTarget() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+  const targets = await fetchJson('/json/list', { stage: 'cdp.json.list' });
   return targets.find(t => t.type === 'page' && t.title === 'New tab') || null;
 }
 
@@ -94,13 +90,13 @@ async function findLandingTarget() {
 async function withTarget(targetId, fn) {
   let c = null;
   try {
-    c = await CDP({ host: CDP_HOST, port: CDP_PORT, target: targetId });
+    c = await withDeadline(() => CDP({ host: CDP_HOST, port: CDP_PORT, target: targetId }), DEFAULT_DEADLINE_MS, 'cdp.connect.tab');
     return await fn(async (expression) => {
-      const { result } = await c.Runtime.evaluate({ expression, returnByValue: true });
+      const { result } = await withDeadline(() => c.Runtime.evaluate({ expression, returnByValue: true }), DEFAULT_DEADLINE_MS, 'cdp.Runtime.evaluate.tab');
       return result?.value;
     });
   } finally {
-    try { if (c) await c.close(); } catch { /* already gone */ }
+    try { if (c) await withDeadline(() => c.close(), DEFAULT_DEADLINE_MS, 'cdp.close.tab'); } catch { /* already gone */ }
   }
 }
 
@@ -147,9 +143,9 @@ export async function newTab({ layout, name } = {}) {
   if (!landing) throw new Error('New tab opened but its landing page target was not found.');
 
   // Snapshot existing chart targets so we can spot the one the pick creates.
-  const beforeResp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  const beforeTargets = await fetchJson('/json/list', { stage: 'cdp.json.list' });
   const chartIdsBefore = new Set(
-    (await beforeResp.json())
+    beforeTargets
       .filter(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
       .map(t => t.id)
   );
@@ -226,8 +222,7 @@ export async function newTab({ layout, name } = {}) {
   let chartTarget = null;
   for (let i = 0; i < 30; i++) {
     await new Promise(r => setTimeout(r, 500));
-    const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-    const targets = await resp.json();
+    const targets = await fetchJson('/json/list', { stage: 'cdp.json.list' });
     chartTarget = targets.find(x =>
       x.type === 'page' && /tradingview\.com\/chart/i.test(x.url) && !chartIdsBefore.has(x.id)
     ) || targets.find(x => x.id === landing.id && /tradingview\.com\/chart/i.test(x.url)) || null;

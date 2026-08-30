@@ -406,9 +406,9 @@ export function buildStrategyResultsJS() {
   `;
 }
 
-export async function getStrategyResults() {
+export async function getStrategyResults({ timeoutMs } = {}) {
   const ready = await ensureStrategyTesterReady();
-  const results = await evaluate(buildStrategyResultsJS());
+  const results = await evaluate(buildStrategyResultsJS(), timeoutMs ? { timeoutMs } : {});
   return {
     success: Object.keys(results?.metrics || {}).length > 0,
     metric_count: Object.keys(results?.metrics || {}).length,

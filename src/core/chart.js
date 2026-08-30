@@ -1,7 +1,7 @@
 /**
  * Core chart control logic.
  */
-import { evaluate as _evaluate, evaluateAsync as _evaluateAsync, safeString, requireFinite } from '../connection.js';
+import { evaluate as _evaluate, evaluateAsync as _evaluateAsync, safeString, requireFinite, withDeadline, DEFAULT_DEADLINE_MS } from '../connection.js';
 import { waitForChartReady as _waitForChartReady } from '../wait.js';
 
 const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
@@ -281,11 +281,13 @@ export async function symbolSearch({ query, type }) {
     domain: 'production',
   });
 
-  const resp = await fetch(`https://symbol-search.tradingview.com/symbol_search/v3/?${params}`, {
+  const controller = new AbortController();
+  const resp = await withDeadline(() => fetch(`https://symbol-search.tradingview.com/symbol_search/v3/?${params}`, {
     headers: { 'Origin': 'https://www.tradingview.com', 'Referer': 'https://www.tradingview.com/' },
-  });
+    signal: controller.signal,
+  }), DEFAULT_DEADLINE_MS, 'http.symbol_search.fetch', () => controller.abort());
   if (!resp.ok) throw new Error(`Symbol search API returned ${resp.status}`);
-  const data = await resp.json();
+  const data = await withDeadline(() => resp.json(), DEFAULT_DEADLINE_MS, 'http.symbol_search.json', () => controller.abort());
 
   const strip = s => (s || '').replace(/<\/?em>/g, '');
   const results = (data.symbols || data || []).slice(0, 15).map(r => ({

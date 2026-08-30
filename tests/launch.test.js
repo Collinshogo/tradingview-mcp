@@ -119,7 +119,7 @@ describe('launch() — MSIX WindowsApps handling', { skip: !onWindows }, () => {
   it('returns cdp_ready:false warning when nothing binds', async () => {
     const { deps } = msixDeps({});
     const result = await launch({ _deps: deps });
-    assert.equal(result.success, true);
+    assert.equal(result.success, false);
     assert.equal(result.cdp_ready, false);
     assert.equal(result.msix_local_copy, true);
     assert.ok(result.warning);

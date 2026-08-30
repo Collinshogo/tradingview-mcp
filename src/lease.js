@@ -1,0 +1,190 @@
+/**
+ * Cross-process mutation lease.  The lock is deliberately a create-exclusive
+ * file rather than an in-memory mutex: separate MCP server processes must see
+ * the same owner and must not interleave TradingView mutations.
+ */
+import { promises as fs, unlinkSync, readFileSync } from 'fs';
+import { randomBytes } from 'crypto';
+import { join } from 'path';
+
+export const MCP_START_TIME = new Date().toISOString();
+export const MCP_PID = process.pid;
+export const LEASE_PATH = process.env.TV_MCP_LEASE_PATH
+  || join(process.env.LOCALAPPDATA || process.env.TMPDIR || '/tmp', 'tradingview-mcp', 'mutation.lease.json');
+const DEFAULT_BUSY_MS = Math.max(100, Number(process.env.TV_MCP_LEASE_BUSY_MS || 2500));
+const DEFAULT_STALE_MS = Math.max(1000, Number(process.env.TV_MCP_LEASE_STALE_MS || 15000));
+const DEFAULT_HEARTBEAT_MS = Math.max(250, Number(process.env.TV_MCP_LEASE_HEARTBEAT_MS || 2000));
+
+export class LeaseBusyError extends Error {
+  constructor(owner, waitedMs) {
+    super(`MCP mutation lease is busy (owner pid ${owner?.pid ?? 'unknown'}, tool ${owner?.tool ?? 'unknown'})`);
+    this.name = 'LeaseBusyError';
+    this.code = 'BUSY';
+    this.owner = owner || null;
+    this.waited_ms = waitedMs;
+    const beat = Date.parse(owner?.heartbeat || owner?.start_time || 0);
+    this.age_ms = Number.isFinite(beat) ? Math.max(0, Date.now() - beat) : null;
+    this.retry_after_ms = Math.min(1000, Math.max(100, this.age_ms == null ? 250 : DEFAULT_HEARTBEAT_MS));
+  }
+}
+
+let localLease = null;
+
+function token() { return randomBytes(24).toString('hex'); }
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function parentDir(path) { return path.slice(0, Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))); }
+async function ensureParent(path) { await fs.mkdir(parentDir(path) || '.', { recursive: true }); }
+
+function processAlive(pid) {
+  if (!pid || pid === process.pid) return pid === process.pid;
+  try { process.kill(Number(pid), 0); return true; } catch (error) { return error?.code === 'EPERM'; }
+}
+
+async function readLease(path) {
+  try { return JSON.parse(await fs.readFile(path, 'utf8')); } catch { return null; }
+}
+
+function staleLease(owner, staleMs) {
+  if (!owner) return true;
+  const beat = Date.parse(owner.heartbeat || owner.start_time || 0);
+  const old = !Number.isFinite(beat) || Date.now() - beat > staleMs;
+  return old && !processAlive(owner.pid);
+}
+
+async function reclaimStale(path, owner, staleMs = DEFAULT_STALE_MS) {
+  if (!owner) {
+    // A creator briefly exposes an empty file between wx and write. Never
+    // steal that live lease; only reclaim malformed content once its mtime is
+    // older than the stale threshold.
+    try {
+      const stat = await fs.stat(path);
+      if (Date.now() - stat.mtimeMs <= staleMs) return false;
+    } catch { return false; }
+  } else if (!staleLease(owner, staleMs)) return false;
+  const moved = `${path}.stale-${token()}`;
+  try {
+    await fs.rename(path, moved);
+    await fs.unlink(moved).catch(() => {});
+    return true;
+  } catch { return false; }
+}
+
+async function writeLease(path, value) {
+  const tmp = `${path}.${value.token}.tmp`;
+  try {
+    await fs.writeFile(tmp, JSON.stringify(value), { encoding: 'utf8', flag: 'wx' });
+    try {
+      await fs.rename(tmp, path);
+    } catch (error) {
+      // Windows rename does not replace an existing file. Update in place
+      // after re-checking the token; the file stays present, so contenders
+      // cannot acquire it during the heartbeat write.
+      if (error?.code !== 'EEXIST' && error?.code !== 'EPERM') throw error;
+      const current = await readLease(path);
+      if (!current || current.token !== value.token) throw new Error('Lease token changed during heartbeat');
+      const handle = await fs.open(path, 'r+');
+      try { await handle.truncate(0); await handle.writeFile(JSON.stringify(value), 'utf8'); }
+      finally { await handle.close(); }
+    }
+  } finally {
+    await fs.unlink(tmp).catch(() => {});
+  }
+}
+
+/** Acquire the process-wide lease, waiting only up to busyMs. */
+export async function acquireLease({ operation = 'mutation', tool = operation, lockPath = LEASE_PATH,
+  busyMs = DEFAULT_BUSY_MS, staleMs = DEFAULT_STALE_MS, heartbeatMs = DEFAULT_HEARTBEAT_MS } = {}) {
+  if (localLease && localLease.lockPath === lockPath) {
+    localLease.owner.operation = operation;
+    localLease.owner.tool = tool;
+    localLease.owner.heartbeat = new Date().toISOString();
+    await writeLease(lockPath, localLease.owner).catch(() => {});
+    return makeHandle(localLease, heartbeatMs);
+  }
+  await ensureParent(lockPath);
+  const started = Date.now();
+  const lease = {
+    token: token(), pid: process.pid, start_time: MCP_START_TIME,
+    operation, tool, heartbeat: new Date().toISOString(),
+  };
+  while (Date.now() - started <= Math.max(0, Number(busyMs) || 0)) {
+    try {
+      const handle = await fs.open(lockPath, 'wx');
+      try { await handle.writeFile(JSON.stringify(lease), 'utf8'); } finally { await handle.close(); }
+      localLease = { lockPath, owner: lease, handles: 0, heartbeat: null };
+      return makeHandle(localLease, heartbeatMs);
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      const current = await readLease(lockPath);
+      if (await reclaimStale(lockPath, current, staleMs)) continue;
+      if (Date.now() - started >= busyMs) throw new LeaseBusyError(current, Date.now() - started);
+      await sleep(Math.min(100, Math.max(10, busyMs - (Date.now() - started))));
+    }
+  }
+  throw new LeaseBusyError(await readLease(lockPath), Date.now() - started);
+}
+
+function makeHandle(state, heartbeatMs) {
+  state.handles = (state.handles || 0) + 1;
+  if (!state.heartbeat) {
+    state.heartbeat = setInterval(async () => {
+      if (localLease !== state) return;
+      const current = await readLease(state.lockPath);
+      if (!current || current.token !== state.owner.token) return;
+      state.owner.heartbeat = new Date().toISOString();
+      await writeLease(state.lockPath, state.owner).catch(() => {});
+    }, heartbeatMs);
+    state.heartbeat.unref?.();
+  }
+  let released = false;
+  return {
+    token: state.owner.token,
+    owner: state.owner,
+    async release() {
+      if (released) return false;
+      released = true;
+      state.handles = Math.max(0, (state.handles || 1) - 1);
+      if (state.handles) return true;
+      if (state.heartbeat) clearInterval(state.heartbeat);
+      state.heartbeat = null;
+      const current = await readLease(state.lockPath);
+      if (!current || current.token !== state.owner.token) {
+        if (localLease === state) localLease = null;
+        return false;
+      }
+      await fs.unlink(state.lockPath).catch(() => {});
+      if (localLease === state) localLease = null;
+      return true;
+    },
+  };
+}
+
+/** Run a direct core mutation while holding the same lease as MCP tools. */
+export async function withLease(options, fn) {
+  const handle = await acquireLease(options);
+  try { return await fn(handle); } finally { await handle.release(); }
+}
+
+export async function releaseLease() {
+  if (!localLease) return false;
+  const state = localLease;
+  // Collapse any re-entrant handles held by the server session, then release
+  // one synthetic handle so the token-checked unlink path is shared.
+  state.handles = 1;
+  const handle = makeHandle(state, DEFAULT_HEARTBEAT_MS);
+  state.handles = 1;
+  return handle.release();
+}
+
+export function isLeaseBusy(error) { return error?.code === 'BUSY' || error instanceof LeaseBusyError; }
+
+process.once('exit', () => {
+  if (localLease) {
+    // exit handlers cannot await; unlink is best-effort and token ownership is
+    // still protected by the heartbeat/stale reclaim rules.
+    try {
+      const current = JSON.parse(readFileSync(localLease.lockPath, 'utf8'));
+      if (current.token === localLease.owner.token) unlinkSync(localLease.lockPath);
+    } catch { /* no-op */ }
+  }
+});

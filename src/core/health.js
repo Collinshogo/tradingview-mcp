@@ -2,9 +2,33 @@
  * Core health/discovery/launch logic.
  */
 import { getClient, getTargetInfo, evaluate, CDP_HOST, CDP_PORT } from '../connection.js';
-import { existsSync, cpSync, rmSync, readdirSync } from 'fs';
+import { existsSync, cpSync, rmSync, readdirSync, readFileSync } from 'fs';
+import { createHash } from 'crypto';
 import { execSync, spawn } from 'child_process';
 import { dirname, basename, join } from 'path';
+import { fileURLToPath } from 'url';
+import { MCP_PID, MCP_START_TIME, withLease } from '../lease.js';
+
+const SRC_DIR = dirname(fileURLToPath(import.meta.url));
+const MCP_ROOT = dirname(SRC_DIR);
+const LOADED_CORE_FILES = [
+  join(SRC_DIR, '..', 'connection.js'), join(SRC_DIR, 'health.js'), join(SRC_DIR, '..', 'server.js'),
+  join(SRC_DIR, '..', 'lease.js'),
+];
+
+function runtimeIdentity() {
+  let gitSha = null;
+  let dirty = null;
+  try { gitSha = execSync('git rev-parse HEAD', { cwd: MCP_ROOT, timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(); } catch { /* unavailable */ }
+  try { dirty = execSync('git status --porcelain --untracked-files=no', { cwd: MCP_ROOT, timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().length > 0; } catch { /* unavailable */ }
+  const hashes = {};
+  for (const file of LOADED_CORE_FILES) {
+    try { hashes[file] = createHash('sha256').update(readFileSync(file)).digest('hex'); } catch { hashes[file] = null; }
+  }
+  return { mcp_pid: MCP_PID, mcp_start_time: MCP_START_TIME, git_sha: gitSha, git_dirty: dirty, loaded_core_hashes: hashes };
+}
+
+export { runtimeIdentity };
 
 // Best-effort git-pull update check: compare local HEAD to origin's default
 // branch on GitHub. Never throws — returns null on any failure (offline,
@@ -14,8 +38,8 @@ async function checkForUpdate() {
   if (_updateCache && (Date.now() - _updateCache.at) < 3600_000) return _updateCache.value;
   let value = null;
   try {
-    const localSha = execSync('git rev-parse HEAD', { timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
-    const remoteUrl = execSync('git config --get remote.origin.url', { timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+    const localSha = execSync('git rev-parse HEAD', { cwd: MCP_ROOT, timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+    const remoteUrl = execSync('git config --get remote.origin.url', { cwd: MCP_ROOT, timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
     const m = remoteUrl.match(/github\.com[:/](.+?)(?:\.git)?$/);
     if (localSha && m) {
       const repo = m[1];
@@ -43,8 +67,16 @@ async function checkForUpdate() {
 }
 
 export async function healthCheck() {
-  await getClient();
-  const target = await getTargetInfo();
+  let target;
+  try {
+    await getClient();
+    target = await getTargetInfo();
+  } catch (error) {
+    return {
+      success: false, ...runtimeIdentity(), cdp_connected: false,
+      error: error?.message || String(error), code: error?.code, stage: error?.stage,
+    };
+  }
 
   const state = await evaluate(`
     (function() {
@@ -70,6 +102,7 @@ export async function healthCheck() {
 
   return {
     success: true,
+    ...runtimeIdentity(),
     cdp_connected: true,
     target_id: target.id,
     target_url: target.url,
@@ -314,7 +347,7 @@ function _copyMsixPackageLocal(tvPath, { cpSync, rmSync, readdirSync, existsSync
   return dstExe;
 }
 
-export async function launch({ port, kill_existing, _deps } = {}) {
+async function launchOwned({ port, kill_existing, _deps } = {}) {
   const deps = _resolveLaunchDeps(_deps);
   const cdpPort = port || CDP_PORT;
   const killFirst = kill_existing !== false;
@@ -423,8 +456,14 @@ export async function launch({ port, kill_existing, _deps } = {}) {
   }
 
   return {
-    success: true, platform, binary: tvPath, pid: child.pid, cdp_port: cdpPort, cdp_ready: false,
+    success: false, platform, binary: tvPath, pid: child.pid, cdp_port: cdpPort, cdp_ready: false,
     ...(usedLocalCopy && { msix_local_copy: true }),
     warning: 'TradingView launched but CDP not responding yet. It may still be loading. Try tv_health_check in a few seconds.',
   };
+}
+
+// Protect direct CLI/core callers too. MCP dispatch is re-entrant for the
+// current process, so this does not double-lock a server-owned operation.
+export async function launch(options = {}) {
+  return withLease({ operation: 'launch', tool: 'tv_launch' }, () => launchOwned(options));
 }

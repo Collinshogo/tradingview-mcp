@@ -10,7 +10,7 @@
  *   Outdated" banner, and stale-report polling — the 07-18 lessons 8-10).
  */
 import { readFileSync } from 'fs';
-import { evaluate, getClient } from '../connection.js';
+import { evaluate, getClient, withDeadline, isDeadlineExceeded } from '../connection.js';
 import * as pine from './pine.js';
 import * as chart from './chart.js';
 import * as data from './data.js';
@@ -525,7 +525,8 @@ export async function deepRun({ script_name, timeframe, from, to, inputs, poll_s
   // report and require the exact range on both ends before accepting.
   // The OLD report keeps being served while the new deep compute runs, so a
   // wrong-range read is NOT a failure signal — poll the full round budget.
-  const perRoundPoll = Math.max(45, Math.floor(poll_seconds / 2));
+  const requestedPollSeconds = Number.isFinite(Number(poll_seconds)) ? Math.max(0.1, Number(poll_seconds)) : 90;
+  const perRoundPoll = Math.max(0.1, requestedPollSeconds / 2);
   let last = null;
   let lastSet = null;
   for (let round = 0; round < 2; round++) {
@@ -545,10 +546,15 @@ export async function deepRun({ script_name, timeframe, from, to, inputs, poll_s
 
     const deadline = Date.now() + perRoundPoll * 1000;
     while (Date.now() < deadline) {
-      await clickUpdateReportIfStale();
-      await delay(3000);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await withDeadline(() => clickUpdateReportIfStale(), remaining, 'deepRun.poll.update');
+      const pause = Math.min(3000, Math.max(0, deadline - Date.now()));
+      if (pause > 0) await delay(pause);
+      const dataRemaining = deadline - Date.now();
+      if (dataRemaining <= 0) break;
       try {
-        last = await data.getStrategyResults();
+        last = await withDeadline(() => data.getStrategyResults({ timeoutMs: dataRemaining }), dataRemaining, 'deepRun.poll.data');
         if (
           last && last.success !== false && last.report_type === 'deep' &&
           last.date_range && last.date_range.from === from &&
@@ -557,7 +563,11 @@ export async function deepRun({ script_name, timeframe, from, to, inputs, poll_s
         ) {
           return { success: true, cleared_strategies: cleared && cleared.removed, entity_id: entityId, rounds: round + 1, served_to: last.date_range.to, requested_to: to, ...last };
         }
-      } catch (e) { /* keep polling */ }
+      } catch (e) {
+        if (isDeadlineExceeded(e)) throw e;
+        // A transient report read can be retried while the advertised poll
+        // budget remains; deadline failures are terminal and never swallowed.
+      }
     }
   }
   return { success: false, stage: 'poll', error: 'Exact-range deep report not served in time', last_range: last && last.date_range, last_set: lastSet };

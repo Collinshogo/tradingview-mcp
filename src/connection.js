@@ -9,6 +9,70 @@ export const CDP_HOST = process.env.TV_CDP_HOST || process.env.CDP_HOST || '127.
 export const CDP_PORT = Number(process.env.TV_CDP_PORT || process.env.CDP_PORT) || 9222;
 const MAX_RETRIES = 5;
 const BASE_DELAY = 500;
+export const DEFAULT_DEADLINE_MS = Math.max(100, Number(process.env.TV_MCP_TIMEOUT_MS || process.env.TV_CDP_TIMEOUT_MS || 10000));
+
+/** Error raised when a CDP/HTTP operation outlives its deadline. */
+export class DeadlineExceeded extends Error {
+  constructor(stage, timeoutMs) {
+    super(`Operation timed out (${stage}) after ${timeoutMs}ms`);
+    this.name = 'DeadlineExceeded';
+    this.code = 'DEADLINE_EXCEEDED';
+    this.stage = stage;
+    this.timeout_ms = timeoutMs;
+  }
+}
+
+export function isDeadlineExceeded(error) {
+  return !!error && (error instanceof DeadlineExceeded || error.code === 'DEADLINE_EXCEEDED' || error.name === 'DeadlineExceeded');
+}
+
+// Alias retained for callers that use the shorter predicate name.
+export const isDeadlineError = isDeadlineExceeded;
+
+/**
+ * Put an outer deadline around a promise or promise factory.  The factory form
+ * is preferred because it does not start work until the timer is installed.
+ * A late-settling promise is observed to avoid unhandled rejection noise.
+ */
+export function withDeadline(operation, timeoutMs = DEFAULT_DEADLINE_MS, stage = 'operation', onTimeout) {
+  const ms = Math.max(1, Number(timeoutMs) || DEFAULT_DEADLINE_MS);
+  let timer;
+  let settled = false;
+  const work = Promise.resolve().then(() => typeof operation === 'function' ? operation() : operation);
+  work.catch(() => {});
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      if (settled) return;
+      try { onTimeout?.(); } catch { /* cleanup must not mask the timeout */ }
+      reject(new DeadlineExceeded(stage, ms));
+    }, ms);
+  });
+  return Promise.race([work, timeout]).finally(() => {
+    settled = true;
+    clearTimeout(timer);
+  });
+}
+
+function invalidateCachedClient(expected = client) {
+  if (!expected || client !== expected) return;
+  client = null;
+  targetInfo = null;
+  try { Promise.resolve(expected.close?.()).catch(() => {}); } catch { /* already closed */ }
+}
+
+function timeoutFor(opts) {
+  return Math.max(1, Number(opts?.timeoutMs ?? opts?.timeout_ms ?? DEFAULT_DEADLINE_MS) || DEFAULT_DEADLINE_MS);
+}
+
+/** Fetch a CDP HTTP endpoint with abort + response-body deadlines. */
+export async function fetchJson(path, { timeoutMs = DEFAULT_DEADLINE_MS, stage = 'http.fetch' } = {}) {
+  const url = /^https?:\/\//i.test(path) ? path : `http://${CDP_HOST}:${CDP_PORT}${path}`;
+  const controller = new AbortController();
+  const response = await withDeadline(
+    () => fetch(url, { signal: controller.signal }), timeoutMs, `${stage}.fetch`, () => controller.abort(),
+  );
+  return withDeadline(() => response.json(), timeoutMs, `${stage}.json`, () => controller.abort());
+}
 
 // Known direct API paths discovered via live probing (see PROBE_RESULTS.md)
 const KNOWN_PATHS = {
@@ -54,11 +118,16 @@ export async function getClient() {
   if (client) {
     try {
       // Quick liveness check
-      await client.Runtime.evaluate({ expression: '1', returnByValue: true });
+      await withDeadline(
+        () => client.Runtime.evaluate({ expression: '1', returnByValue: true }),
+        DEFAULT_DEADLINE_MS,
+        'cdp.liveness',
+        () => invalidateCachedClient(client),
+      );
       return client;
-    } catch {
-      client = null;
-      targetInfo = null;
+    } catch (error) {
+      invalidateCachedClient(client);
+      if (isDeadlineExceeded(error)) throw error;
     }
   }
   return connect();
@@ -75,21 +144,31 @@ export async function connect(targetId = null) {
           : 'No TradingView chart target found. Is TradingView open with a chart?');
       }
       targetInfo = target;
-      client = await CDP({ host: CDP_HOST, port: CDP_PORT, target: target.id });
+      client = await withDeadline(
+        () => CDP({ host: CDP_HOST, port: CDP_PORT, target: target.id }),
+        DEFAULT_DEADLINE_MS,
+        'cdp.connect',
+        () => invalidateCachedClient(client),
+      );
 
       // Enable required domains
-      await client.Runtime.enable();
-      await client.Page.enable();
-      await client.DOM.enable();
+      await withDeadline(() => client.Runtime.enable(), DEFAULT_DEADLINE_MS, 'cdp.Runtime.enable', () => invalidateCachedClient(client));
+      await withDeadline(() => client.Page.enable(), DEFAULT_DEADLINE_MS, 'cdp.Page.enable', () => invalidateCachedClient(client));
+      await withDeadline(() => client.DOM.enable(), DEFAULT_DEADLINE_MS, 'cdp.DOM.enable', () => invalidateCachedClient(client));
 
       return client;
     } catch (err) {
       lastError = err;
+      if (isDeadlineExceeded(err)) throw err;
+      invalidateCachedClient(client);
       const delay = Math.min(BASE_DELAY * Math.pow(2, attempt), 30000);
       await new Promise(r => setTimeout(r, delay));
     }
   }
-  throw new Error(`CDP connection failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
+  const error = new Error(`CDP connection failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
+  error.code = 'CDP_CONNECT_FAILED';
+  error.stage = 'cdp.connect';
+  throw error;
 }
 
 /**
@@ -100,16 +179,16 @@ export async function connect(targetId = null) {
  */
 export async function reconnectTo(targetId) {
   if (client) {
-    try { await client.close(); } catch { /* already gone */ }
+    const c = client;
     client = null;
     targetInfo = null;
+    try { await withDeadline(() => c.close(), DEFAULT_DEADLINE_MS, 'cdp.close'); } catch { /* already gone */ }
   }
   return connect(targetId);
 }
 
 async function findChartTarget() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+  const { targets } = await fetchTargets('cdp.json.list');
   // Prefer targets with tradingview.com/chart in the URL
   return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
     || targets.find(t => t.type === 'page' && /tradingview/i.test(t.url))
@@ -117,9 +196,21 @@ async function findChartTarget() {
 }
 
 async function findTargetById(id) {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+  const { targets } = await fetchTargets('cdp.json.list');
   return targets.find(t => t.id === id) || null;
+}
+
+async function fetchTargets(stage) {
+  const url = `http://${CDP_HOST}:${CDP_PORT}/json/list`;
+  const controller = new AbortController();
+  const resp = await withDeadline(
+    () => fetch(url, { signal: controller.signal }),
+    DEFAULT_DEADLINE_MS,
+    `${stage}.fetch`,
+    () => controller.abort(),
+  );
+  const targets = await withDeadline(() => resp.json(), DEFAULT_DEADLINE_MS, `${stage}.json`, () => controller.abort());
+  return { resp, targets };
 }
 
 export async function getTargetInfo() {
@@ -131,12 +222,18 @@ export async function getTargetInfo() {
 
 export async function evaluate(expression, opts = {}) {
   const c = await getClient();
-  const result = await c.Runtime.evaluate({
-    expression,
-    returnByValue: true,
-    awaitPromise: opts.awaitPromise ?? false,
-    ...opts,
-  });
+  const { timeoutMs, timeout_ms, ...evaluateOpts } = opts;
+  const result = await withDeadline(
+    () => c.Runtime.evaluate({
+      expression,
+      returnByValue: true,
+      awaitPromise: evaluateOpts.awaitPromise ?? false,
+      ...evaluateOpts,
+    }),
+    timeoutFor({ timeoutMs, timeout_ms }),
+    evaluateOpts.awaitPromise ? 'cdp.Runtime.evaluate.awaitPromise' : 'cdp.Runtime.evaluate',
+    () => invalidateCachedClient(c),
+  );
   if (result.exceptionDetails) {
     const msg = result.exceptionDetails.exception?.description
       || result.exceptionDetails.text
@@ -146,15 +243,16 @@ export async function evaluate(expression, opts = {}) {
   return result.result?.value;
 }
 
-export async function evaluateAsync(expression) {
-  return evaluate(expression, { awaitPromise: true });
+export async function evaluateAsync(expression, opts = {}) {
+  return evaluate(expression, { ...opts, awaitPromise: true });
 }
 
 export async function disconnect() {
   if (client) {
-    try { await client.close(); } catch {}
+    const c = client;
     client = null;
     targetInfo = null;
+    try { await withDeadline(() => c.close(), DEFAULT_DEADLINE_MS, 'cdp.close'); } catch {}
   }
 }
 

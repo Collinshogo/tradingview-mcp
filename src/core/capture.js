@@ -1,7 +1,7 @@
 /**
  * Core screenshot/capture logic.
  */
-import { getClient, evaluate, getChartCollection } from '../connection.js';
+import { getClient, evaluate, getChartCollection, disconnect, withDeadline, DEFAULT_DEADLINE_MS } from '../connection.js';
 import { waitForChartRender } from '../wait.js';
 import { writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
@@ -63,7 +63,12 @@ export async function captureScreenshot({ region, filename, method, waitForRende
   const params = { format: 'png' };
   if (clip) params.clip = clip;
 
-  const { data } = await client.Page.captureScreenshot(params);
+  const { data } = await withDeadline(
+    () => client.Page.captureScreenshot(params),
+    DEFAULT_DEADLINE_MS,
+    'cdp.Page.captureScreenshot',
+    () => { void disconnect(); },
+  );
   writeFileSync(filePath, Buffer.from(data, 'base64'));
 
   return {
