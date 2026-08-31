@@ -187,10 +187,14 @@ test('empty study readiness fails closed before any input write can occur', asyn
   // deepRun only calls setInputs after waitForStudyInputs().ok is true.
 });
 
-test('study readiness requires every requested value and real Pine definition', async () => {
+test('ready compiled Pine inputs are accepted even when TradingView marks every definition fake', async () => {
   const study = {
     getInputValues: () => [{ id: 'in_0', value: 'Manual' }, { id: 'in_156', value: 'TOK OPT' }],
-    getInputsInfo: () => [{ id: 'in_0', name: 'Config', isFake: false }, { id: 'in_156', name: 'Tokyo config', isFake: false }],
+    getInputsInfo: () => [
+      { id: 'in_0', name: 'Config', active: true, isFake: true },
+      { id: 'in_156', name: 'Tokyo config', active: true, isFake: true },
+    ],
+    _study: { status: () => ({ type: 2 }) },
   };
   const ready = await waitForStudyInputs({
     entityId: 'study', requestedInputKeys: ['in_0', 'in_156'], timeoutMs: 20,
@@ -199,36 +203,58 @@ test('study readiness requires every requested value and real Pine definition', 
     }),
     delayFn: async () => {},
   });
-  assert.deepEqual(ready, { ok: true, length: 2, requested: 2 });
+  assert.deepEqual(ready, {
+    ok: true,
+    length: 2,
+    definition_length: 2,
+    requested: 2,
+    status_type: 2,
+  });
 });
 
-test('fake strategy-property IDs cannot satisfy Pine readiness even when names collide', async () => {
-  let now = 0;
+test('terminal compile-error property shell fails closed even when a requested ID collides', async () => {
+  let evaluations = 0;
+  const definitions = Array.from({ length: 30 }, (_, index) => ({
+    id: index === 0 ? 'in_0' : `strategy_property_${index}`,
+    active: true,
+    isFake: index < 25,
+  }));
   const study = {
-    getInputValues: () => [{ id: 'in_0', value: 'Manual' }],
-    getInputsInfo: () => [{ id: 'in_0', name: 'Config', isFake: true }],
+    getInputValues: () => definitions.map(({ id }) => ({ id, value: null })),
+    getInputsInfo: () => definitions,
+    _study: { status: () => ({ type: 3 }) },
   };
   const ready = await waitForStudyInputs({
-    entityId: 'study', requestedInputKeys: ['in_0'], timeoutMs: 3,
-    evaluateFn: async (expression) => runInNewContext(expression, {
-      window: { TradingViewApi: { _activeChartWidgetWV: { value: () => ({ getStudyById: () => study }) } } },
-    }),
-    delayFn: async () => { now++; },
-    nowFn: () => now,
+    entityId: 'study', requestedInputKeys: ['in_0', 'in_117'], timeoutMs: 20,
+    evaluateFn: async (expression) => {
+      evaluations++;
+      return runInNewContext(expression, {
+        window: { TradingViewApi: { _activeChartWidgetWV: { value: () => ({ getStudyById: () => study }) } } },
+      });
+    },
+    delayFn: async () => {},
   });
-  assert.equal(ready.ok, false);
-  assert.deepEqual(ready.missing_values, []);
-  assert.deepEqual(ready.non_real_inputs, ['in_0']);
+  assert.deepEqual(ready, {
+    ok: false,
+    length: 30,
+    definition_length: 30,
+    status_type: 3,
+    terminal: true,
+    missing_values: ['in_117'],
+    missing_definitions: ['in_117'],
+    inactive_definitions: [],
+  });
+  assert.equal(evaluations, 1);
 });
 
-test('slow Pine input registration is polled through fake and partial snapshots', async () => {
+test('slow Pine input registration waits for ready status and complete active requested IDs', async () => {
   let now = 0;
   let evaluations = 0;
   const snapshots = [
-    { length: 25, value_ids: ['in_0', 'in_156'], real_input_ids: [], fake_input_ids: ['in_0', 'in_156'] },
-    { length: 191, value_ids: ['in_0'], real_input_ids: ['in_0'], fake_input_ids: [] },
-    { length: 191, value_ids: ['in_0', 'in_156'], real_input_ids: ['in_0'], fake_input_ids: [] },
-    { length: 191, value_ids: ['in_0', 'in_156'], real_input_ids: ['in_0', 'in_156'], fake_input_ids: [] },
+    { length: 30, definition_length: 30, value_ids: ['in_0'], definition_ids: ['in_0'], active_definition_ids: ['in_0'], status_type: 1 },
+    { length: 226, definition_length: 226, value_ids: ['in_0', 'in_156'], definition_ids: ['in_0', 'in_156'], active_definition_ids: ['in_0', 'in_156'], status_type: 1 },
+    { length: 226, definition_length: 226, value_ids: ['in_0', 'in_156'], definition_ids: ['in_0'], active_definition_ids: ['in_0'], status_type: 2 },
+    { length: 226, definition_length: 226, value_ids: ['in_0', 'in_156'], definition_ids: ['in_0', 'in_156'], active_definition_ids: ['in_0', 'in_156'], status_type: 2 },
   ];
   const ready = await waitForStudyInputs({
     entityId: 'study', requestedInputKeys: ['in_0', 'in_156'], timeoutMs: 10,
@@ -237,6 +263,7 @@ test('slow Pine input registration is polled through fake and partial snapshots'
     nowFn: () => now,
   });
   assert.equal(ready.ok, true);
+  assert.equal(ready.status_type, 2);
   assert.equal(ready.requested, 2);
   assert.equal(evaluations, 4);
 });

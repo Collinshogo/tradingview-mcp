@@ -60,9 +60,12 @@ export function resolveDeepRangeEnd(requestedEnd, availableEnd, endPolicy = 'thr
 }
 
 /**
- * Poll study input registration without ever accepting TradingView's temporary
- * fake strategy-property inputs as Pine user inputs. Large Pine scripts expose
- * those fake `in_*` IDs before their real input definitions finish compiling.
+ * Poll until the attached study has completed compilation and every requested
+ * input is materialized in both the value and active-definition registries.
+ * TradingView marks compiled Pine definitions `isFake: true`, so that flag
+ * cannot distinguish them from the small strategy-property shell exposed by a
+ * failed compile. The backing study status is authoritative: 2 is ready and 3
+ * is a terminal compile error.
  */
 export async function waitForStudyInputs({
   entityId,
@@ -73,23 +76,46 @@ export async function waitForStudyInputs({
   nowFn = Date.now,
 } = {}) {
   const requested = [...new Set((requestedInputKeys || []).map(String))];
-  const requestedPineInputs = requested.filter((key) => /^in_\d+$/.test(key));
   const deadline = nowFn() + timeoutMs;
   let snapshot = null;
+  const summarize = (value) => {
+    const valueIds = new Set(Array.isArray(value?.value_ids) ? value.value_ids.map(String) : []);
+    const definitionIds = new Set(Array.isArray(value?.definition_ids) ? value.definition_ids.map(String) : []);
+    const activeDefinitionIds = new Set(Array.isArray(value?.active_definition_ids) ? value.active_definition_ids.map(String) : []);
+    const rawStatusType = value?.status_type;
+    const statusType = rawStatusType != null && Number.isFinite(Number(rawStatusType)) ? Number(rawStatusType) : null;
+    return {
+      ok: false,
+      length: Number(value?.length) || 0,
+      definition_length: Number(value?.definition_length) || 0,
+      status_type: statusType,
+      terminal: statusType === 3,
+      missing_values: requested.filter((key) => !valueIds.has(key)),
+      missing_definitions: requested.filter((key) => !definitionIds.has(key)),
+      inactive_definitions: requested.filter((key) => definitionIds.has(key) && !activeDefinitionIds.has(key)),
+    };
+  };
   while (nowFn() < deadline) {
     snapshot = await evaluateFn(
       '(function() {' +
       '  var cw = window.TradingViewApi._activeChartWidgetWV.value();' +
       '  var st = cw.getStudyById(' + JSON.stringify(entityId) + ');' +
-      '  if (!st) return { length: 0, value_ids: [], real_input_ids: [], fake_input_ids: [] };' +
+      '  if (!st) return { length: 0, definition_length: 0, value_ids: [], definition_ids: [], active_definition_ids: [], status_type: null };' +
       '  var requested = ' + JSON.stringify(requested) + ';' +
       '  var values = [];' +
       '  var definitions = [];' +
+      '  var statusType = null;' +
       '  try { values = st.getInputValues() || []; } catch (e) {}' +
       '  try { definitions = st.getInputsInfo ? (st.getInputsInfo() || []) : []; } catch (e) {}' +
+      '  try {' +
+      '    var backingStudy = st._study || st;' +
+      '    var status = backingStudy && typeof backingStudy.status === "function" ? backingStudy.status() : backingStudy && backingStudy.status;' +
+      '    if (status && typeof status.value === "function") status = status.value();' +
+      '    statusType = status && Number.isFinite(Number(status.type)) ? Number(status.type) : null;' +
+      '  } catch (e) {}' +
       '  var valueIds = [];' +
-      '  var realIds = [];' +
-      '  var fakeIds = [];' +
+      '  var definitionIds = [];' +
+      '  var activeDefinitionIds = [];' +
       '  for (var i = 0; i < values.length; i++) {' +
       '    var valueId = values[i] && String(values[i].id);' +
       '    if (requested.indexOf(valueId) !== -1) valueIds.push(valueId);' +
@@ -98,33 +124,31 @@ export async function waitForStudyInputs({
       '    var definition = definitions[j];' +
       '    var definitionId = definition && String(definition.id);' +
       '    if (requested.indexOf(definitionId) === -1) continue;' +
-      '    if (definition.isFake === false) realIds.push(definitionId);' +
-      '    if (definition.isFake === true) fakeIds.push(definitionId);' +
+      '    definitionIds.push(definitionId);' +
+      '    if (definition.active === true) activeDefinitionIds.push(definitionId);' +
       '  }' +
-      '  return { length: values.length, value_ids: valueIds, real_input_ids: realIds, fake_input_ids: fakeIds };' +
+      '  return { length: values.length, definition_length: definitions.length, value_ids: valueIds, definition_ids: definitionIds, active_definition_ids: activeDefinitionIds, status_type: statusType };' +
       '})()', { timeoutMs: Math.max(1, deadline - nowFn()) },
     );
-    const valueIds = new Set(Array.isArray(snapshot?.value_ids) ? snapshot.value_ids.map(String) : []);
-    const realInputIds = new Set(Array.isArray(snapshot?.real_input_ids) ? snapshot.real_input_ids.map(String) : []);
-    const fakeInputIds = new Set(Array.isArray(snapshot?.fake_input_ids) ? snapshot.fake_input_ids.map(String) : []);
-    const valuesReady = requested.length
-      ? requested.every((key) => valueIds.has(key))
-      : Number(snapshot?.length) > 0;
-    const metadataReady = requestedPineInputs.every((key) => realInputIds.has(key) && !fakeInputIds.has(key));
-    if (valuesReady && metadataReady) {
-      return { ok: true, length: Number(snapshot?.length) || 0, requested: requested.length };
+    const state = summarize(snapshot);
+    const requestedReady = requested.length
+      ? state.missing_values.length === 0
+        && state.missing_definitions.length === 0
+        && state.inactive_definitions.length === 0
+      : state.length > 0 && state.definition_length > 0;
+    if (state.status_type === 2 && requestedReady) {
+      return {
+        ok: true,
+        length: state.length,
+        definition_length: state.definition_length,
+        requested: requested.length,
+        status_type: state.status_type,
+      };
     }
+    if (state.terminal) return state;
     await delayFn(Math.min(500, Math.max(1, deadline - nowFn())));
   }
-  const valueIds = new Set(Array.isArray(snapshot?.value_ids) ? snapshot.value_ids.map(String) : []);
-  const realInputIds = new Set(Array.isArray(snapshot?.real_input_ids) ? snapshot.real_input_ids.map(String) : []);
-  const fakeInputIds = new Set(Array.isArray(snapshot?.fake_input_ids) ? snapshot.fake_input_ids.map(String) : []);
-  return {
-    ok: false,
-    length: Number(snapshot?.length) || 0,
-    missing_values: requested.filter((key) => !valueIds.has(key)),
-    non_real_inputs: requestedPineInputs.filter((key) => !realInputIds.has(key) || fakeInputIds.has(key)),
-  };
+  return summarize(snapshot);
 }
 
 export function compactVerifiedInputs(wanted, readback) {
@@ -1081,7 +1105,7 @@ export async function deepRun({ script_name, timeframe, from, to, end_policy = '
   // Locate the study we just added. A lone strategy is never enough evidence:
   // require the exact saved Pine script ID from the verified editor open and
   // reject any entity ID that belonged to the removed prior strategy set.
-  // One bounded compile budget is used for both attachment and real Pine input
+  // One bounded compile budget is used for both attachment and Pine input
   // registration. Default 90 s; caller-selectable up to an exact 180 s ceiling.
   const compileBudgetMs = Math.max(10000, Math.min(180000, Number(poll_seconds) * 1000 || 90000));
   const attached = await waitForAttachedStrategy({
@@ -1119,7 +1143,9 @@ export async function deepRun({ script_name, timeframe, from, to, end_policy = '
       return {
         success: false,
         stage: 'inputs_ready',
-        error: 'Requested real Pine inputs did not become available before the readiness deadline',
+        error: ready.terminal
+          ? 'The attached study reached a terminal compile-error status before its requested Pine inputs became ready'
+          : 'Requested Pine inputs did not become available on a ready study before the readiness deadline',
         input_readiness: ready,
       };
     }
