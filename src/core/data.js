@@ -559,9 +559,20 @@ export function buildFullTradesJS() {
           var tr = source[i] || {};
           var en = tr.entry || {};
           var ex = tr.exit || {};
+          // TradingView's normalized BacktestingStrategyFacade/API rows use
+          // exactly "le" (long entry) and "se" (short entry), as captured by
+          // the repository fixtures. "lx"/"sx" are exit encodings, not entries.
+          var side = null;
+          if (en.type === 'le') side = 'long';
+          else if (en.type === 'se') side = 'short';
+          else {
+            var tradeRef = tr.tradeNumber != null ? tr.tradeNumber : i;
+            var badType = en.type == null ? String(en.type) : JSON.stringify(en.type);
+            throw new Error('Unsupported TradingView entry.type for trade ' + tradeRef + ': ' + badType + '; expected "le" or "se".');
+          }
           result.push({
             trade_number: tr.tradeNumber,
-            side: (en.type && en.type.charAt(0) === 's') ? 'short' : 'long',
+            side: side,
             qty: tr.quantity,
             entry_time_ms: en.time != null ? en.time : null,
             exit_time_ms: ex.time != null ? ex.time : null,
@@ -644,6 +655,7 @@ export async function exportTradesCsv({ filename, output_path, path, header_line
   const output = resolveTradeExportPath(filename ?? output_path ?? path, deps.cwd);
   await deps.ensureStrategyTesterReady();
   const report = await deps.evaluate(buildFullTradesJS());
+  if (report?.error) throw new Error(`Trade export failed: ${report.error}`);
   if (!report || report.report_type !== 'deep') throw new Error('Trade export requires an active computed DEEP report');
   if (!Array.isArray(report.trades)) throw new Error('DEEP report did not provide a trade list');
   if (!Number.isInteger(report.total_trades) || report.total_trades < 0) throw new Error('DEEP report did not provide a valid total trade count');
