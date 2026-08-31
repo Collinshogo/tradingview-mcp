@@ -580,7 +580,10 @@ export function buildFullTradesJS() {
           var exitIncomplete = !exitAbsent && (typeof tr.exit !== 'object' || Array.isArray(tr.exit)
             || tr.exit.time == null || tr.exit.price == null);
           var isSingleExtraTerminal = i === source.length - 1 && source.length === total + 1;
-          if ((exitAbsent || exitIncomplete) && isSingleExtraTerminal) {
+          // TradingView can synthesize mark-to-market exit fields for the open
+          // terminal row.  The reliable discriminator is therefore structural:
+          // exactly one tail row beyond performance.all.totalTrades.
+          if (isSingleExtraTerminal) {
             openSkipped++;
             continue;
           }

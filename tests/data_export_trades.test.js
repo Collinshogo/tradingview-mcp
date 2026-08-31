@@ -125,7 +125,8 @@ describe('data_export_trades_csv', () => {
 
   it('exports authoritative closed trades while excluding a structurally open terminal row', () => {
     const openTrade = rawTrade(3, 'le');
-    openTrade.exit = {};
+    openTrade.exit = { type: 'lx', time: 1767225780000, price: 21008, id: '' };
+    openTrade.profit = { value: -29 };
     delete openTrade.profit;
     const pageResult = evalPageScript(
       buildFullTradesJS(),
