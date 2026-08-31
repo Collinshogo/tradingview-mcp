@@ -84,6 +84,7 @@ const FIND_EDITOR_PARTS = `
 const defaultDeps = {
   evaluate,
   evaluateAsync,
+  getClient,
   delay: (ms) => new Promise(r => setTimeout(r, ms)),
 };
 
@@ -140,6 +141,26 @@ export function buildPineTabFallbackJS() {
       if (!explicitlyInactive && !collapsed && !otherPanelVisible) return false;
       btn.click();
       return true;
+    })()
+  `;
+}
+
+export function buildFocusMonacoForSaveJS() {
+  return `
+    (function() { /* tv-mcp:focus-monaco-for-save */
+      var m = ${FIND_MONACO};
+      if (!m || !m.editor || typeof m.editor.focus !== 'function') {
+        return { ok: false, reason: 'visible Pine Monaco editor unavailable' };
+      }
+      try {
+        m.editor.focus();
+      } catch (e) {
+        return { ok: false, reason: String(e && e.message ? e.message : e) };
+      }
+      if (typeof m.editor.hasTextFocus === 'function' && !m.editor.hasTextFocus()) {
+        return { ok: false, reason: 'visible Pine Monaco editor did not take text focus' };
+      }
+      return { ok: true, focus_verified: typeof m.editor.hasTextFocus === 'function' };
     })()
   `;
 }
@@ -673,17 +694,26 @@ export async function getErrors() {
   };
 }
 
-export async function save() {
-  const editorReady = await ensurePineEditorOpen();
+export async function save({ _deps } = {}) {
+  const deps = { ...defaultDeps, ..._deps };
+  const editorReady = await ensurePineEditorOpen(deps);
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
-  const c = await getClient();
+  // smartCompile leaves keyboard focus on TradingView's Compile button. A
+  // document-level Ctrl+S from that state can be accepted by CDP but silently
+  // do nothing, so bind the shortcut to the exact visible Pine Monaco editor.
+  const focused = await deps.evaluate(buildFocusMonacoForSaveJS());
+  if (!focused?.ok) {
+    throw new Error(`Could not focus visible Pine Monaco editor before save: ${focused?.reason || 'unknown focus failure'}`);
+  }
+
+  const c = await deps.getClient();
   await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 's', code: 'KeyS', windowsVirtualKeyCode: 83 });
   await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 's', code: 'KeyS' });
-  await new Promise(r => setTimeout(r, 800));
+  await deps.delay(800);
 
   // Handle "Save Script" name dialog that appears for new/unsaved scripts
-  const dialogHandled = await evaluate(`
+  const dialogHandled = await deps.evaluate(`
     (function() {
       var saveBtn = null;
       var btns = document.querySelectorAll('button');
@@ -700,7 +730,7 @@ export async function save() {
     })()
   `);
 
-  if (dialogHandled) await new Promise(r => setTimeout(r, 500));
+  if (dialogHandled) await deps.delay(500);
 
   return { success: true, action: dialogHandled ? 'saved_with_dialog' : 'Ctrl+S_dispatched' };
 }

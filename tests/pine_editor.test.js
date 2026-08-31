@@ -24,8 +24,10 @@ import {
   openScript,
   newScript,
   setSource,
+  save,
   ensurePineEditorOpen,
   buildPineTabFallbackJS,
+  buildFocusMonacoForSaveJS,
   FIND_MONACO,
   fingerprintSource,
   getSourceInfo,
@@ -142,6 +144,91 @@ function mockDeps({ scripts = [], active = [null], editorValue = '', openResult 
 }
 
 beforeEach(() => _resetEditorTargetState());
+
+describe('save — Monaco focus binding', () => {
+  it('page-side helper focuses the visible Pine Monaco instance', () => {
+    let focusCalls = 0;
+    const container = {
+      parentElement: null,
+      getBoundingClientRect: () => ({ width: 900, height: 700 }),
+      contains: (node) => node === container,
+    };
+    const editor = {
+      getDomNode: () => container,
+      focus: () => { focusCalls++; },
+      hasTextFocus: () => focusCalls === 1,
+    };
+    const env = { editor: { getEditors: () => [editor] } };
+    container.__reactFiber$test = { memoizedProps: { monacoEnv: env }, return: null };
+    const document = { querySelectorAll: () => [container] };
+
+    const result = runInNewContext(buildFocusMonacoForSaveJS(), { document });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.focus_verified, true);
+    assert.equal(focusCalls, 1);
+  });
+
+  it('page-side helper fails closed when visible Pine Monaco is unavailable', () => {
+    const document = { querySelectorAll: () => [] };
+
+    const result = runInNewContext(buildFocusMonacoForSaveJS(), { document });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, 'visible Pine Monaco editor unavailable');
+  });
+
+  it('focuses the exact visible Monaco editor before dispatching Ctrl+S', async () => {
+    const events = [];
+    const deps = {
+      delay: async (ms) => { events.push(`delay:${ms}`); },
+      evaluate: async (expr) => {
+        if (expr.includes('tv-mcp:focus-monaco-for-save')) {
+          events.push('focus');
+          return { ok: true, focus_verified: true };
+        }
+        if (expr.includes('var saveBtn = null')) return false;
+        if (expr.includes('findMonacoEditor')) return true;
+        return null;
+      },
+      getClient: async () => ({
+        Input: {
+          dispatchKeyEvent: async (event) => { events.push(event.type); },
+        },
+      }),
+    };
+
+    const result = await save({ _deps: deps });
+
+    assert.equal(result.success, true);
+    assert.deepEqual(events.slice(0, 3), ['focus', 'keyDown', 'keyUp']);
+  });
+
+  it('fails closed before key dispatch when visible Monaco cannot be focused', async () => {
+    let keyDispatched = false;
+    const deps = {
+      delay: async () => {},
+      evaluate: async (expr) => {
+        if (expr.includes('tv-mcp:focus-monaco-for-save')) {
+          return { ok: false, reason: 'visible Pine Monaco editor unavailable' };
+        }
+        if (expr.includes('findMonacoEditor')) return true;
+        return null;
+      },
+      getClient: async () => ({
+        Input: {
+          dispatchKeyEvent: async () => { keyDispatched = true; },
+        },
+      }),
+    };
+
+    await assert.rejects(
+      () => save({ _deps: deps }),
+      /Could not focus visible Pine Monaco editor before save: visible Pine Monaco editor unavailable/
+    );
+    assert.equal(keyDispatched, false);
+  });
+});
 
 describe('pickScriptRecord', () => {
   const scripts = [SCRIPT_A, SCRIPT_B];
