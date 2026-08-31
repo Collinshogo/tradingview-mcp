@@ -160,7 +160,7 @@ const DEEP_BACKTESTING_JS = `
     return { facade_found: true, deep_active: !!facade._isDeepBacktesting, report: report, chart_report: chartReport, status_type: statusType, active_name: name };
   }
   function deepStatusLabel(statusType) {
-    return statusType === 1 ? 'loading' : (statusType === 3 ? 'error' : 'not-generated');
+    return statusType === 1 ? 'loading' : (statusType === 2 ? 'completed' : (statusType === 3 ? 'error' : 'not-generated'));
   }
   function deepPendingWarning(statusType, what) {
     return 'Deep Backtesting mode is ON but the deep report is not available (' + deepStatusLabel(statusType) + '). ' +
@@ -299,6 +299,25 @@ export async function getIndicator({ entity_id }) {
 // strategies, and wait for reportData to populate, so the strategy read tools
 // work even when the panel started closed or the strategy was hidden.
 // Returns { status, unhidden } — unhidden lists strategies made visible.
+export function buildStrategyReadyJS() {
+  return `
+    (function() {
+      ${FIND_STRATEGY_JS}
+      ${DEEP_BACKTESTING_JS}
+      var f = findStrategy();
+      var deep = readDeepState();
+      if (deep.deep_active) {
+        // A completed report object remains cached while TradingView recomputes.
+        // Manager loading state therefore outranks the presence of that object.
+        if (deep.status_type === 1) return 'pending';
+        return 'ready';
+      }
+      if (!f) return 'no-strategy';
+      return f.report && f.report.performance ? 'ready' : 'pending';
+    })()
+  `;
+}
+
 async function ensureStrategyTesterReady(maxWaitMs = 6000) {
   const unhidden = await evaluate(`
     (function() {
@@ -313,23 +332,7 @@ async function ensureStrategyTesterReady(maxWaitMs = 6000) {
   const deadline = Date.now() + maxWaitMs;
   let status = 'timeout';
   while (Date.now() < deadline) {
-    const ready = await evaluate(`
-      (function() {
-        ${FIND_STRATEGY_JS}
-        ${DEEP_BACKTESTING_JS}
-        var f = findStrategy();
-        var deep = readDeepState();
-        if (deep.deep_active) {
-          // In deep mode, wait for the deep report (a generate request may be in
-          // flight after the panel opens). If no request is running there is
-          // nothing to wait for — proceed and let the caller see the warning.
-          if (deep.report && deep.report.performance) return 'ready';
-          return deep.status_type === 1 ? 'pending' : 'ready';
-        }
-        if (!f) return 'no-strategy';
-        return f.report && f.report.performance ? 'ready' : 'pending';
-      })()
-    `);
+    const ready = await evaluate(buildStrategyReadyJS());
     if (ready === 'ready' || ready === 'no-strategy') { status = ready; break; }
     await new Promise(r => setTimeout(r, 500));
   }
@@ -352,6 +355,8 @@ export function buildStrategyResultsJS() {
         if (haveDeepReport) {
           rd = deep.report;
           reportType = 'deep';
+          extra.deep_mode_active = true;
+          extra.deep_status = deepStatusLabel(deep.status_type);
           try {
             var b = rd.settings && rd.settings.dateRange && rd.settings.dateRange.backtest;
             if (b && b.from != null && b.to != null) extra.date_range = { from: new Date(b.from).toISOString().slice(0, 10), to: new Date(b.to).toISOString().slice(0, 10) };

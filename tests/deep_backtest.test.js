@@ -11,7 +11,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildStrategyResultsJS, buildTradesJS } from '../src/core/data.js';
+import { buildStrategyReadyJS, buildStrategyResultsJS, buildTradesJS } from '../src/core/data.js';
 
 // ── Page-context evaluation harness ──────────────────────────────────────
 // Runs the same script string the tool would pass to CDP Runtime.evaluate,
@@ -158,7 +158,19 @@ describe('strategy results — deep backtesting', () => {
     assert.equal(r.strategy, 'AFT LVL-4H'); // full description resolved via active-strategy id
     assert.deepEqual(r.date_range, { from: '2025-01-02', to: '2026-04-01' });
     assert.equal(r.error, undefined);
-    assert.equal(r.deep_mode_active, undefined);
+    assert.equal(r.deep_mode_active, true);
+    assert.equal(r.deep_status, 'completed');
+    assert.equal(evalPageScript(buildStrategyReadyJS(), win), 'ready');
+  });
+
+  it('exposes loading when an old deep report object remains cached', () => {
+    const win = makeWindow({ facade: makeFacade({ isDeep: true, deepReportValue: deepReport(), statusType: 1 }) });
+    const r = evalPageScript(buildStrategyResultsJS(), win);
+    assert.equal(r.report_type, 'deep');
+    assert.equal(r.metrics.profit_factor, 1.9185);
+    assert.equal(r.deep_mode_active, true);
+    assert.equal(r.deep_status, 'loading');
+    assert.equal(evalPageScript(buildStrategyReadyJS(), win), 'pending');
   });
 
   it('does NOT silently return shallow numbers when deep mode is on but the report is loading', () => {
@@ -180,9 +192,9 @@ describe('strategy results — deep backtesting', () => {
   });
 
   it('flags deep_status error when the deep request failed', () => {
-    const win = makeWindow({ facade: makeFacade({ isDeep: true, deepReportValue: null, statusType: 3 }) });
+    const win = makeWindow({ facade: makeFacade({ isDeep: true, deepReportValue: deepReport(), statusType: 3 }) });
     const r = evalPageScript(buildStrategyResultsJS(), win);
-    assert.equal(r.report_type, 'standard');
+    assert.equal(r.report_type, 'deep');
     assert.equal(r.deep_status, 'error');
   });
 

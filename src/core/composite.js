@@ -78,6 +78,12 @@ export async function waitForStudyInputs({ entityId, evaluateFn = evaluate, dela
   return { ok: false, length: 0 };
 }
 
+export function compactVerifiedInputs(wanted, readback) {
+  const verified = {};
+  for (const key of Object.keys(wanted || {})) verified[key] = readback?.[key];
+  return verified;
+}
+
 /**
  * Wait for TradingView to finish compiling and attach the strategy clicked in
  * the Pine editor. Large chassis scripts can take tens of seconds to compile;
@@ -346,6 +352,18 @@ export async function setRangeAndSelect(from, to, endPolicy = 'through_latest', 
   for (let attempt = 0; attempt < 2; attempt++) {
     const pre = await deps.evaluate(READ_DATES_JS);
     const preEnd = pre && pre[1];
+    if (!Array.isArray(pre) || !isIsoDate(preEnd)) {
+      if (attempt === 0) {
+        await deps.closeDialogIfOpen();
+        await deps.delay(500);
+        await deps.clickTesterChip();
+        await deps.delay(600);
+        await deps.clickCustomRange();
+        await deps.delay(600);
+        continue;
+      }
+      return { ok: false, why: 'deep date picker values were not readable', v0: pre && pre[0], v1: preEnd };
+    }
     const endSelection = resolveDeepRangeEnd(to, preEnd, endPolicy);
     if (endSelection.error) {
       return { ok: false, fatal: true, why: endSelection.error, v0: pre && pre[0], v1: preEnd };
@@ -421,7 +439,7 @@ export function terminalDeepReportError({ report, ui, thrown } = {}) {
     };
   }
   if (status === 'loading' || status === 'not-generated') return null;
-  if (genericError && !RETRYABLE_DEEP_MESSAGE_RE.test(genericError)) {
+  if (genericError && TERMINAL_DEEP_ERROR_RE.test(genericError) && !RETRYABLE_DEEP_MESSAGE_RE.test(genericError)) {
     return { source: 'report', message: genericError };
   }
   if (warning && TERMINAL_DEEP_ERROR_RE.test(warning) && !RETRYABLE_DEEP_MESSAGE_RE.test(warning)) {
@@ -492,6 +510,7 @@ async function clickUpdateReportIfStale() {
 
 function matchesArmedDeepRange(report, from, armedTo) {
   if (!report || report.success === false || report.report_type !== 'deep' || !report.date_range) return false;
+  if (String(report.deep_status || '').toLowerCase() !== 'completed') return false;
   if (!isIsoDate(armedTo) || report.date_range.from !== from) return false;
   return report.date_range.to === armedTo || report.date_range.to === plusOneDay(armedTo);
 }
@@ -509,6 +528,8 @@ export async function pollDeepReport({ from, armedTo, timeoutMs, _deps } = {}) {
   const budget = Math.max(1, Number(timeoutMs) || 1);
   const deadline = deps.now() + budget;
   let last = null;
+  let recomputeRequired = false;
+  let recomputePendingSeen = false;
 
   while (deps.now() < deadline) {
     let remaining = deadline - deps.now();
@@ -518,14 +539,24 @@ export async function pollDeepReport({ from, armedTo, timeoutMs, _deps } = {}) {
     try {
       ui = await deps.withDeadline(() => deps.updateReport(), remaining, 'deepRun.poll.update');
     } catch (error) {
-      if (deps.isDeadlineExceeded(error)) throw error;
+      if (deps.isDeadlineExceeded(error)) return { status: 'timeout', last };
       const terminal = terminalDeepReportError({ thrown: error });
       if (terminal) return { status: 'terminal', error: terminal.message, terminal_source: terminal.source, last };
-      throw error;
+      const pause = Math.min(3000, Math.max(0, deadline - deps.now()));
+      if (pause > 0) await deps.delay(pause);
+      continue;
     }
     const visibleTerminal = terminalDeepReportError({ ui });
     if (visibleTerminal) {
       return { status: 'terminal', error: visibleTerminal.message, terminal_source: visibleTerminal.source, last };
+    }
+    if (ui?.clicked) {
+      // A click starts a new generation. Its cached report cannot prove freshness
+      // until the manager exposes a pending/loading state for this generation.
+      recomputeRequired = true;
+      recomputePendingSeen = false;
+    } else if (ui?.outdated) {
+      recomputeRequired = true;
     }
     if (ui?.clicked) {
       const settle = Math.min(750, Math.max(0, deadline - deps.now()));
@@ -544,9 +575,19 @@ export async function pollDeepReport({ from, armedTo, timeoutMs, _deps } = {}) {
       if (reportTerminal) {
         return { status: 'terminal', error: reportTerminal.message, terminal_source: reportTerminal.source, last };
       }
-      if (matchesArmedDeepRange(last, from, armedTo)) return { status: 'matched', last };
+      const deepStatus = String(last?.deep_status || '').toLowerCase();
+      if (recomputeRequired && (deepStatus === 'loading' || deepStatus === 'pending' || deepStatus === 'not-generated')) {
+        recomputePendingSeen = true;
+      }
+      // Selecting/updating a range can leave the previous completed report
+      // cached indefinitely. After a stale/update observation, fail closed
+      // unless this poll saw the current generation become pending before done.
+      const freshGeneration = !recomputeRequired || recomputePendingSeen;
+      if (freshGeneration && !ui?.outdated && !ui?.clicked && matchesArmedDeepRange(last, from, armedTo)) {
+        return { status: 'matched', last };
+      }
     } catch (error) {
-      if (deps.isDeadlineExceeded(error)) throw error;
+      if (deps.isDeadlineExceeded(error)) return { status: 'timeout', last };
       const terminal = terminalDeepReportError({ thrown: error });
       if (terminal) return { status: 'terminal', error: terminal.message, terminal_source: terminal.source, last };
       // A transient report read remains retryable while the advertised budget remains.
@@ -756,6 +797,7 @@ export async function deepRun({ script_name, timeframe, from, to, end_policy = '
       : 'strategy compile/attach did not complete before the deadline';
     return { success: false, stage: 'attach', error: detail };
   }
+  let verifiedInputs;
   if (inputs) {
     const wanted = typeof inputs === 'string' ? JSON.parse(inputs) : inputs;
     // The freshly-added study can still be compiling; avoid writing an empty
@@ -783,6 +825,7 @@ export async function deepRun({ script_name, timeframe, from, to, end_policy = '
     if (!readback || mismatched.length) {
       return { success: false, stage: 'inputs', error: 'input overrides did not apply: ' + JSON.stringify(mismatched.map((k) => ({ key: k, wanted: wanted[k], got: readback && readback[k] }))) };
     }
+    verifiedInputs = compactVerifiedInputs(wanted, readback);
   }
 
   // Arm-and-verify rounds: the picker sometimes fails to commit the range at Select
@@ -837,7 +880,7 @@ export async function deepRun({ script_name, timeframe, from, to, end_policy = '
       };
     }
     if (polled.status === 'matched') {
-      return { success: true, cleared_strategies: cleared && cleared.removed, entity_id: entityId, rounds: round + 1, served_to: last.date_range.to, requested_to: to, end_policy, ...last };
+      return { success: true, cleared_strategies: cleared && cleared.removed, entity_id: entityId, rounds: round + 1, served_to: last.date_range.to, requested_to: to, end_policy, ...last, ...(verifiedInputs && { verified_inputs: verifiedInputs }) };
     }
   }
   return { success: false, stage: 'poll', error: 'Exact-range deep report not served in time', last_range: last && last.date_range, last_set: lastSet };

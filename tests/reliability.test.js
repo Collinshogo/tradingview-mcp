@@ -14,7 +14,7 @@ import {
 import { runtimeIdentity } from '../src/core/health.js';
 import { registerCompositeTools } from '../src/tools/composite.js';
 import {
-  buildDeepReportUiStateJS, pollDeepReport, resolveDeepRangeEnd, setRangeAndSelect,
+  buildDeepReportUiStateJS, compactVerifiedInputs, pollDeepReport, resolveDeepRangeEnd, setRangeAndSelect,
   waitForAttachedStrategy, waitForStudyInputs,
 } from '../src/core/composite.js';
 
@@ -159,6 +159,16 @@ test('empty study readiness fails closed before any input write can occur', asyn
   // deepRun only calls setInputs after waitForStudyInputs().ok is true.
 });
 
+test('verified input receipt retains only requested overrides', () => {
+  assert.deepEqual(
+    compactVerifiedInputs(
+      { atrLength: 7, useLongs: false },
+      { atrLength: 7, useLongs: false, unrequestedA: 1, unrequestedB: 2 },
+    ),
+    { atrLength: 7, useLongs: false },
+  );
+});
+
 test('slow Pine compile is polled until one attached strategy appears', async () => {
   let evaluations = 0;
   const attached = await waitForAttachedStrategy({
@@ -272,6 +282,30 @@ test('exact deep end rejects invalid or beyond-latest dates before typing', asyn
   assert.deepEqual(harness.typed, []);
 });
 
+test('temporarily unreadable picker dates reopen and retry', async () => {
+  let reads = 0;
+  let closed = false;
+  let reopens = 0;
+  const values = ['2025-01-01', '2026-08-31'];
+  const selected = await setRangeAndSelect('2026-01-01', undefined, 'through_latest', {
+    evaluate: async () => {
+      reads++;
+      if (reads === 1 || closed) return null;
+      return [...values];
+    },
+    typeDateField: async (index, value) => { values[index] = value; return true; },
+    delay: async () => {},
+    clickSelect: async () => { closed = true; return true; },
+    closeDialogIfOpen: async () => { closed = true; return true; },
+    clickTesterChip: async () => { closed = false; reopens++; return true; },
+    clickCustomRange: async () => true,
+  });
+  assert.equal(selected.ok, true);
+  assert.equal(selected.v0, '2026-01-01');
+  assert.equal(selected.v1, '2026-08-31');
+  assert.equal(reopens, 1);
+});
+
 test('public deep-run tool defaults to through_latest and requires opt-in exact policy', () => {
   let registration = null;
   registerCompositeTools({
@@ -290,8 +324,8 @@ test('public deep-run tool defaults to through_latest and requires opt-in exact 
 test('deep polling accepts only the armed TradingView end convention, not an arbitrary nominal end', async () => {
   let reads = 0;
   const reports = [
-    { success: true, report_type: 'deep', date_range: { from: '2026-01-01', to: '2026-09-01' } },
-    { success: true, report_type: 'deep', date_range: { from: '2026-01-01', to: '2026-08-29' } },
+    { success: true, report_type: 'deep', deep_status: 'completed', date_range: { from: '2026-01-01', to: '2026-09-01' } },
+    { success: true, report_type: 'deep', deep_status: 'completed', date_range: { from: '2026-01-01', to: '2026-08-29' } },
   ];
   const result = await pollDeepReport({
     from: '2026-01-01',
@@ -318,7 +352,7 @@ test('deep polling accepts TradingView exclusive end at exactly armed end plus o
       updateReport: async () => ({ outdated: false, clicked: false }),
       getStrategyResults: async () => {
         reads++;
-        return { success: true, report_type: 'deep', date_range: { from: '2026-01-01', to: '2027-01-01' } };
+        return { success: true, report_type: 'deep', deep_status: 'completed', date_range: { from: '2026-01-01', to: '2027-01-01' } };
       },
       delay: async () => {},
     },
@@ -363,23 +397,61 @@ test('visible deep errors are panel-scoped and stale errors do not block Update 
   assert.match(fresh.terminal_error, /Runtime error/);
 });
 
-test('an Update report click settles before the first deep report read', async () => {
+test('an Update report click cannot accept the previously served same-range report', async () => {
   const events = [];
+  let polls = 0;
+  let reads = 0;
   const result = await pollDeepReport({
     from: '2026-01-01',
     armedTo: '2026-08-29',
     timeoutMs: 1000,
     _deps: {
-      updateReport: async () => { events.push('update'); return { outdated: true, clicked: true }; },
+      updateReport: async () => {
+        events.push('update');
+        polls++;
+        return polls === 1 ? { outdated: true, clicked: true } : { outdated: false, clicked: false };
+      },
       getStrategyResults: async () => {
         events.push('read');
-        return { success: true, report_type: 'deep', date_range: { from: '2026-01-01', to: '2026-08-29' } };
+        reads++;
+        return {
+          success: true,
+          report_type: 'deep',
+          deep_status: reads === 2 ? 'loading' : 'completed',
+          date_range: { from: '2026-01-01', to: '2026-08-29' },
+        };
       },
       delay: async (ms) => { events.push(`delay:${ms}`); },
     },
   });
   assert.equal(result.status, 'matched');
-  assert.deepEqual(events, ['update', 'delay:750', 'read']);
+  assert.equal(events.filter((event) => event === 'read').length, 3);
+  assert.deepEqual(events.slice(0, 3), ['update', 'delay:750', 'read']);
+  assert.deepEqual(events.slice(-2), ['update', 'read']);
+});
+
+test('stale Update fails closed without a manager pending transition', async () => {
+  let clock = 0;
+  let polls = 0;
+  let reads = 0;
+  const result = await pollDeepReport({
+    from: '2026-01-01',
+    armedTo: '2026-08-29',
+    timeoutMs: 5,
+    _deps: {
+      updateReport: async () => (++polls === 1
+        ? { outdated: true, clicked: true }
+        : { outdated: false, clicked: false }),
+      getStrategyResults: async () => {
+        reads++;
+        return { success: true, report_type: 'deep', deep_status: 'completed', date_range: { from: '2026-01-01', to: '2026-08-29' } };
+      },
+      delay: async () => { clock++; },
+      now: () => clock,
+    },
+  });
+  assert.equal(result.status, 'timeout');
+  assert.ok(reads >= 2);
 });
 
 test('deep polling returns terminal report/runtime errors on the first observation', async (t) => {
@@ -406,9 +478,9 @@ test('deep polling returns terminal report/runtime errors on the first observati
       reads: 1,
     },
     {
-      name: 'non-pending generic error',
+      name: 'positively recognized generic terminal error',
       ui: { outdated: false, clicked: false },
-      report: { success: false, error: 'No strategy found on chart.' },
+      report: { success: false, error: 'Deep backtesting report generation failed.' },
       source: 'report',
       reads: 1,
     },
@@ -443,6 +515,84 @@ test('deep polling returns terminal report/runtime errors on the first observati
   }
 });
 
+test('arbitrary transient report errors remain retryable', async () => {
+  let clock = 0;
+  let reads = 0;
+  const result = await pollDeepReport({
+    from: '2026-01-01',
+    armedTo: '2026-08-29',
+    timeoutMs: 10,
+    _deps: {
+      updateReport: async () => ({ outdated: false, clicked: false }),
+      getStrategyResults: async () => {
+        reads++;
+        return { success: false, error: 'Execution context was destroyed during a panel rerender.' };
+      },
+      delay: async (ms) => { clock += ms; },
+      now: () => clock,
+    },
+  });
+  assert.equal(result.status, 'timeout');
+  assert.equal(reads, 1);
+});
+
+test('a transient panel rerender during Update remains retryable', async () => {
+  let clock = 0;
+  let updates = 0;
+  let reads = 0;
+  const result = await pollDeepReport({
+    from: '2026-01-01',
+    armedTo: '2026-08-29',
+    timeoutMs: 100,
+    _deps: {
+      updateReport: async () => {
+        updates++;
+        if (updates === 1) throw new Error('Execution context was destroyed during a panel rerender.');
+        return { outdated: false, clicked: false };
+      },
+      getStrategyResults: async () => {
+        reads++;
+        return { success: true, report_type: 'deep', deep_status: 'completed', date_range: { from: '2026-01-01', to: '2026-08-29' } };
+      },
+      delay: async () => { clock++; },
+      now: () => clock,
+    },
+  });
+  assert.equal(result.status, 'matched');
+  assert.equal(updates, 2);
+  assert.equal(reads, 1);
+});
+
+test('never-resolving update read normalizes its inner deadline to poll timeout', async () => {
+  let reads = 0;
+  const result = await pollDeepReport({
+    from: '2026-01-01',
+    armedTo: '2026-08-29',
+    timeoutMs: 20,
+    _deps: {
+      updateReport: async () => new Promise(() => {}),
+      getStrategyResults: async () => { reads++; return null; },
+      delay: async () => {},
+    },
+  });
+  assert.equal(result.status, 'timeout');
+  assert.equal(reads, 0);
+});
+
+test('never-resolving strategy-results read normalizes its inner deadline to poll timeout', async () => {
+  const result = await pollDeepReport({
+    from: '2026-01-01',
+    armedTo: '2026-08-29',
+    timeoutMs: 20,
+    _deps: {
+      updateReport: async () => ({ outdated: false, clicked: false }),
+      getStrategyResults: async () => new Promise(() => {}),
+      delay: async () => {},
+    },
+  });
+  assert.equal(result.status, 'timeout');
+});
+
 test('pending deep report remains retryable before the armed report arrives', async () => {
   let reads = 0;
   const result = await pollDeepReport({
@@ -461,13 +611,53 @@ test('pending deep report remains retryable before the armed report arrives', as
             warning: 'Deep Backtesting mode is ON but the deep report is not available (loading).',
           };
         }
-        return { success: true, report_type: 'deep', date_range: { from: '2026-01-01', to: '2026-08-29' } };
+        return { success: true, report_type: 'deep', deep_status: 'completed', date_range: { from: '2026-01-01', to: '2026-08-29' } };
       },
       delay: async () => {},
     },
   });
   assert.equal(result.status, 'matched');
   assert.equal(reads, 2);
+});
+
+test('old same-range report stays pending while loading, then completed is accepted', async () => {
+  let reads = 0;
+  const result = await pollDeepReport({
+    from: '2026-01-01',
+    armedTo: '2026-08-29',
+    timeoutMs: 1000,
+    _deps: {
+      updateReport: async () => ({ outdated: false, clicked: false }),
+      getStrategyResults: async () => ({
+        success: true,
+        report_type: 'deep',
+        deep_status: ++reads === 1 ? 'loading' : 'completed',
+        date_range: { from: '2026-01-01', to: '2026-08-29' },
+      }),
+      delay: async () => {},
+    },
+  });
+  assert.equal(result.status, 'matched');
+  assert.equal(reads, 2);
+});
+
+test('completed same-range report is accepted without an Update cycle', async () => {
+  let reads = 0;
+  const result = await pollDeepReport({
+    from: '2026-01-01',
+    armedTo: '2026-08-29',
+    timeoutMs: 1000,
+    _deps: {
+      updateReport: async () => ({ outdated: false, clicked: false }),
+      getStrategyResults: async () => {
+        reads++;
+        return { success: true, report_type: 'deep', deep_status: 'completed', date_range: { from: '2026-01-01', to: '2026-08-29' } };
+      },
+      delay: async () => {},
+    },
+  });
+  assert.equal(result.status, 'matched');
+  assert.equal(reads, 1);
 });
 
 test('exclusive process mode protects direct connection imports until owner exit', async () => {
