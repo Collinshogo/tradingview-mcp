@@ -898,7 +898,13 @@ export async function newScript({ type, _deps }) {
 
 export async function openScript({ name, _deps }) {
   const deps = { ...defaultDeps, ..._deps };
-  const editorReady = await ensurePineEditorOpen(deps);
+  let editorReady = await ensurePineEditorOpen(deps);
+  if (!editorReady) {
+    // A chart/panel transition can finish just after the first bounded probe.
+    // Allow one settle-and-retry cycle, then retain the fail-closed behavior.
+    await deps.delay(500);
+    editorReady = await ensurePineEditorOpen(deps);
+  }
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
   const list = await deps.evaluateAsync(`

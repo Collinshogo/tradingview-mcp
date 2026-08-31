@@ -200,6 +200,56 @@ describe('openScript — really switches the editor', () => {
     const { deps } = mockDeps({ scripts: [SCRIPT_A], openResult: { error: 'Pine editor facade not found — is the Pine Editor open and its script-title button visible?' } });
     await assert.rejects(() => openScript({ name: 'AFT A1 Cascade', _deps: deps }), /facade not found/);
   });
+
+  it('retries once after a delayed panel transition and then opens the script', async () => {
+    const { deps, state } = mockDeps({
+      scripts: [SCRIPT_B],
+      active: [activeOf(SCRIPT_B)],
+      editorValue: '//@version=6\nplot(close)',
+    });
+    const baseEvaluate = deps.evaluate;
+    const delays = [];
+    let monacoReads = 0;
+    deps.delay = async (ms) => { delays.push(ms); };
+    deps.evaluate = async (expr) => {
+      if (!expr.includes('tv-mcp:') && expr.includes('findMonacoEditor')) {
+        monacoReads++;
+        return monacoReads > 51;
+      }
+      return baseEvaluate(expr);
+    };
+
+    const result = await openScript({ name: 'AFT Gap Fade', _deps: deps });
+
+    assert.equal(result.success, true);
+    assert.equal(monacoReads, 52, 'first bounded ensure must fail; second must succeed');
+    assert.equal(delays.filter(ms => ms === 500).length, 1, 'retry must be delayed exactly once');
+    assert.equal(state.openCalls.length, 1);
+  });
+
+  it('fails closed after two bounded editor-open attempts', async () => {
+    const { deps, state } = mockDeps({ scripts: [SCRIPT_B] });
+    const baseEvaluate = deps.evaluate;
+    const delays = [];
+    let monacoReads = 0;
+    deps.delay = async (ms) => { delays.push(ms); };
+    deps.evaluate = async (expr) => {
+      if (!expr.includes('tv-mcp:') && expr.includes('findMonacoEditor')) {
+        monacoReads++;
+        return false;
+      }
+      return baseEvaluate(expr);
+    };
+
+    await assert.rejects(
+      () => openScript({ name: 'AFT Gap Fade', _deps: deps }),
+      /Could not open Pine Editor/
+    );
+
+    assert.equal(monacoReads, 102, 'must stop after two bounded ensure attempts');
+    assert.equal(delays.filter(ms => ms === 500).length, 1, 'must not start a third retry');
+    assert.equal(state.openCalls.length, 0, 'must not touch the facade without a verified editor');
+  });
 });
 
 describe('fingerprintSource', () => {
