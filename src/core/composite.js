@@ -59,23 +59,72 @@ export function resolveDeepRangeEnd(requestedEnd, availableEnd, endPolicy = 'thr
   return { explicit: requested < available, effective_end: requested };
 }
 
-/** Poll study input registration without ever writing an empty snapshot. */
-export async function waitForStudyInputs({ entityId, evaluateFn = evaluate, delayFn = delay, timeoutMs = 10000 } = {}) {
-  const deadline = Date.now() + timeoutMs;
-  let length = 0;
-  while (Date.now() < deadline) {
-    length = await evaluateFn(
+/**
+ * Poll study input registration without ever accepting TradingView's temporary
+ * fake strategy-property inputs as Pine user inputs. Large Pine scripts expose
+ * those fake `in_*` IDs before their real input definitions finish compiling.
+ */
+export async function waitForStudyInputs({
+  entityId,
+  requestedInputKeys = [],
+  evaluateFn = evaluate,
+  delayFn = delay,
+  timeoutMs = 90000,
+  nowFn = Date.now,
+} = {}) {
+  const requested = [...new Set((requestedInputKeys || []).map(String))];
+  const requestedPineInputs = requested.filter((key) => /^in_\d+$/.test(key));
+  const deadline = nowFn() + timeoutMs;
+  let snapshot = null;
+  while (nowFn() < deadline) {
+    snapshot = await evaluateFn(
       '(function() {' +
       '  var cw = window.TradingViewApi._activeChartWidgetWV.value();' +
       '  var st = cw.getStudyById(' + JSON.stringify(entityId) + ');' +
-      '  if (!st) return 0;' +
-      '  try { return st.getInputValues().length; } catch (e) { return 0; }' +
-      '})()', { timeoutMs: Math.max(1, deadline - Date.now()) },
+      '  if (!st) return { length: 0, value_ids: [], real_input_ids: [], fake_input_ids: [] };' +
+      '  var requested = ' + JSON.stringify(requested) + ';' +
+      '  var values = [];' +
+      '  var definitions = [];' +
+      '  try { values = st.getInputValues() || []; } catch (e) {}' +
+      '  try { definitions = st.getInputsInfo ? (st.getInputsInfo() || []) : []; } catch (e) {}' +
+      '  var valueIds = [];' +
+      '  var realIds = [];' +
+      '  var fakeIds = [];' +
+      '  for (var i = 0; i < values.length; i++) {' +
+      '    var valueId = values[i] && String(values[i].id);' +
+      '    if (requested.indexOf(valueId) !== -1) valueIds.push(valueId);' +
+      '  }' +
+      '  for (var j = 0; j < definitions.length; j++) {' +
+      '    var definition = definitions[j];' +
+      '    var definitionId = definition && String(definition.id);' +
+      '    if (requested.indexOf(definitionId) === -1) continue;' +
+      '    if (definition.isFake === false) realIds.push(definitionId);' +
+      '    if (definition.isFake === true) fakeIds.push(definitionId);' +
+      '  }' +
+      '  return { length: values.length, value_ids: valueIds, real_input_ids: realIds, fake_input_ids: fakeIds };' +
+      '})()', { timeoutMs: Math.max(1, deadline - nowFn()) },
     );
-    if (length > 0) return { ok: true, length };
-    await delayFn(Math.min(500, Math.max(1, deadline - Date.now())));
+    const valueIds = new Set(Array.isArray(snapshot?.value_ids) ? snapshot.value_ids.map(String) : []);
+    const realInputIds = new Set(Array.isArray(snapshot?.real_input_ids) ? snapshot.real_input_ids.map(String) : []);
+    const fakeInputIds = new Set(Array.isArray(snapshot?.fake_input_ids) ? snapshot.fake_input_ids.map(String) : []);
+    const valuesReady = requested.length
+      ? requested.every((key) => valueIds.has(key))
+      : Number(snapshot?.length) > 0;
+    const metadataReady = requestedPineInputs.every((key) => realInputIds.has(key) && !fakeInputIds.has(key));
+    if (valuesReady && metadataReady) {
+      return { ok: true, length: Number(snapshot?.length) || 0, requested: requested.length };
+    }
+    await delayFn(Math.min(500, Math.max(1, deadline - nowFn())));
   }
-  return { ok: false, length: 0 };
+  const valueIds = new Set(Array.isArray(snapshot?.value_ids) ? snapshot.value_ids.map(String) : []);
+  const realInputIds = new Set(Array.isArray(snapshot?.real_input_ids) ? snapshot.real_input_ids.map(String) : []);
+  const fakeInputIds = new Set(Array.isArray(snapshot?.fake_input_ids) ? snapshot.fake_input_ids.map(String) : []);
+  return {
+    ok: false,
+    length: Number(snapshot?.length) || 0,
+    missing_values: requested.filter((key) => !valueIds.has(key)),
+    non_real_inputs: requestedPineInputs.filter((key) => !realInputIds.has(key) || fakeInputIds.has(key)),
+  };
 }
 
 export function compactVerifiedInputs(wanted, readback) {
@@ -1032,11 +1081,14 @@ export async function deepRun({ script_name, timeframe, from, to, end_policy = '
   // Locate the study we just added. A lone strategy is never enough evidence:
   // require the exact saved Pine script ID from the verified editor open and
   // reject any entity ID that belonged to the removed prior strategy set.
+  // One bounded compile budget is used for both attachment and real Pine input
+  // registration. Default 90 s; caller-selectable up to an exact 180 s ceiling.
+  const compileBudgetMs = Math.max(10000, Math.min(180000, Number(poll_seconds) * 1000 || 90000));
   const attached = await waitForAttachedStrategy({
     scriptName: script_name,
     expectedTarget: opened,
     forbiddenEntityIds: cleared?.removed_entity_ids,
-    timeoutMs: Math.max(10000, Math.min(180000, Number(poll_seconds) * 1000 || 90000)),
+    timeoutMs: compileBudgetMs,
   });
   const entityId = attached.ok ? attached.entity_id : null;
   if (!entityId) {
@@ -1058,9 +1110,18 @@ export async function deepRun({ script_name, timeframe, from, to, end_policy = '
     const wanted = typeof inputs === 'string' ? JSON.parse(inputs) : inputs;
     // The freshly-added study can still be compiling; avoid writing an empty
     // input snapshot, which silently no-ops or wedges the study.
-    const ready = await waitForStudyInputs({ entityId });
+    const ready = await waitForStudyInputs({
+      entityId,
+      requestedInputKeys: Object.keys(wanted),
+      timeoutMs: compileBudgetMs,
+    });
     if (!ready.ok) {
-      return { success: false, stage: 'inputs_ready', error: 'Study inputs did not become available before the readiness deadline' };
+      return {
+        success: false,
+        stage: 'inputs_ready',
+        error: 'Requested real Pine inputs did not become available before the readiness deadline',
+        input_readiness: ready,
+      };
     }
     const { setInputs } = await import('./indicators.js');
     await setInputs({ entity_id: entityId, inputs: JSON.stringify(wanted) });

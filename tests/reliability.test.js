@@ -187,6 +187,60 @@ test('empty study readiness fails closed before any input write can occur', asyn
   // deepRun only calls setInputs after waitForStudyInputs().ok is true.
 });
 
+test('study readiness requires every requested value and real Pine definition', async () => {
+  const study = {
+    getInputValues: () => [{ id: 'in_0', value: 'Manual' }, { id: 'in_156', value: 'TOK OPT' }],
+    getInputsInfo: () => [{ id: 'in_0', name: 'Config', isFake: false }, { id: 'in_156', name: 'Tokyo config', isFake: false }],
+  };
+  const ready = await waitForStudyInputs({
+    entityId: 'study', requestedInputKeys: ['in_0', 'in_156'], timeoutMs: 20,
+    evaluateFn: async (expression) => runInNewContext(expression, {
+      window: { TradingViewApi: { _activeChartWidgetWV: { value: () => ({ getStudyById: () => study }) } } },
+    }),
+    delayFn: async () => {},
+  });
+  assert.deepEqual(ready, { ok: true, length: 2, requested: 2 });
+});
+
+test('fake strategy-property IDs cannot satisfy Pine readiness even when names collide', async () => {
+  let now = 0;
+  const study = {
+    getInputValues: () => [{ id: 'in_0', value: 'Manual' }],
+    getInputsInfo: () => [{ id: 'in_0', name: 'Config', isFake: true }],
+  };
+  const ready = await waitForStudyInputs({
+    entityId: 'study', requestedInputKeys: ['in_0'], timeoutMs: 3,
+    evaluateFn: async (expression) => runInNewContext(expression, {
+      window: { TradingViewApi: { _activeChartWidgetWV: { value: () => ({ getStudyById: () => study }) } } },
+    }),
+    delayFn: async () => { now++; },
+    nowFn: () => now,
+  });
+  assert.equal(ready.ok, false);
+  assert.deepEqual(ready.missing_values, []);
+  assert.deepEqual(ready.non_real_inputs, ['in_0']);
+});
+
+test('slow Pine input registration is polled through fake and partial snapshots', async () => {
+  let now = 0;
+  let evaluations = 0;
+  const snapshots = [
+    { length: 25, value_ids: ['in_0', 'in_156'], real_input_ids: [], fake_input_ids: ['in_0', 'in_156'] },
+    { length: 191, value_ids: ['in_0'], real_input_ids: ['in_0'], fake_input_ids: [] },
+    { length: 191, value_ids: ['in_0', 'in_156'], real_input_ids: ['in_0'], fake_input_ids: [] },
+    { length: 191, value_ids: ['in_0', 'in_156'], real_input_ids: ['in_0', 'in_156'], fake_input_ids: [] },
+  ];
+  const ready = await waitForStudyInputs({
+    entityId: 'study', requestedInputKeys: ['in_0', 'in_156'], timeoutMs: 10,
+    evaluateFn: async () => snapshots[Math.min(evaluations++, snapshots.length - 1)],
+    delayFn: async () => { now++; },
+    nowFn: () => now,
+  });
+  assert.equal(ready.ok, true);
+  assert.equal(ready.requested, 2);
+  assert.equal(evaluations, 4);
+});
+
 test('verified input receipt retains only requested overrides', () => {
   assert.deepEqual(
     compactVerifiedInputs(
