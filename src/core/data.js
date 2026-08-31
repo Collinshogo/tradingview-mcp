@@ -555,10 +555,10 @@ export function buildFullTradesJS() {
         if (!all || typeof all.totalTrades !== 'number') return {trades: [], total_trades: null, report_type: 'deep', error: 'The DEEP report did not provide an authoritative total trade count.'};
         var total = all.totalTrades;
         var result = [];
+        var openSkipped = 0;
         for (var i = 0; i < source.length; i++) {
           var tr = source[i] || {};
           var en = tr.entry || {};
-          var ex = tr.exit || {};
           // TradingView's normalized BacktestingStrategyFacade/API rows use
           // exactly "le" (long entry) and "se" (short entry), as captured by
           // the repository fixtures. "lx"/"sx" are exit encodings, not entries.
@@ -569,6 +569,21 @@ export function buildFullTradesJS() {
             var tradeRef = tr.tradeNumber != null ? tr.tradeNumber : i;
             var badType = en.type == null ? String(en.type) : JSON.stringify(en.type);
             throw new Error('Unsupported TradingView entry.type for trade ' + tradeRef + ': ' + badType + '; expected "le" or "se".');
+          }
+          // performance.all.totalTrades is TradingView's authoritative CLOSED
+          // trade count.  The facade may append the currently open position to
+          // report.trades; that row is uniquely identifiable by having no exit
+          // object.  Exclude only that shape.  Once an exit object exists, treat
+          // the row as closed and fail on missing close fields instead of hiding
+          // a malformed/partial closed trade behind the count reconciliation.
+          if (!Object.prototype.hasOwnProperty.call(tr, 'exit') || tr.exit == null) {
+            openSkipped++;
+            continue;
+          }
+          var ex = tr.exit;
+          if (typeof ex !== 'object' || Array.isArray(ex) || ex.time == null || ex.price == null) {
+            var closedRef = tr.tradeNumber != null ? tr.tradeNumber : i;
+            throw new Error('Malformed closed TradingView trade ' + closedRef + ': exit must be an object containing time and price.');
           }
           result.push({
             trade_number: tr.tradeNumber,
@@ -587,6 +602,7 @@ export function buildFullTradesJS() {
         return {
           trades: result,
           total_trades: total,
+          open_trades_skipped: openSkipped,
           report_type: 'deep',
           strategy: deep.active_name || null,
           date_range: backtest && backtest.from != null && backtest.to != null

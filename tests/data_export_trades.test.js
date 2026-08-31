@@ -62,9 +62,9 @@ function rawTrade(tradeNumber, type) {
   };
 }
 
-function deepWindow(trades) {
+function deepWindow(trades, totalTrades = trades.length) {
   const deepReport = {
-    performance: { all: { totalTrades: trades.length } },
+    performance: { all: { totalTrades } },
     settings: { dateRange: { backtest: { from: 1767225600000, to: 1788048000000 } } },
     trades,
   };
@@ -121,6 +121,38 @@ describe('data_export_trades_csv', () => {
     assert.equal(pageResult.error, undefined);
     assert.deepEqual(pageResult.trades.map((trade) => trade.side), ['long', 'short']);
     assert.equal(pageResult.total_trades, 2);
+  });
+
+  it('exports authoritative closed trades while excluding a structurally open terminal row', () => {
+    const openTrade = rawTrade(3, 'le');
+    delete openTrade.exit;
+    delete openTrade.profit;
+    const pageResult = evalPageScript(
+      buildFullTradesJS(),
+      deepWindow([rawTrade(1, 'le'), rawTrade(2, 'se'), openTrade], 2),
+    );
+    assert.equal(pageResult.error, undefined);
+    assert.deepEqual(pageResult.trades.map((trade) => trade.trade_number), [1, 2]);
+    assert.equal(pageResult.total_trades, 2);
+    assert.equal(pageResult.open_trades_skipped, 1);
+  });
+
+  it('fails closed instead of disguising a malformed closed row as an open trade', async () => {
+    const malformed = rawTrade(2, 'se');
+    malformed.exit = {};
+    const pageResult = evalPageScript(
+      buildFullTradesJS(),
+      deepWindow([rawTrade(1, 'le'), malformed], 2),
+    );
+    assert.deepEqual(pageResult.trades, []);
+    assert.equal(pageResult.total_trades, null);
+    assert.match(pageResult.error, /Malformed closed TradingView trade 2/);
+
+    await assert.rejects(
+      () => exportTradesCsv({ filename: 'malformed-closed.csv', _deps: deps(pageResult) }),
+      /Trade export failed: Malformed closed TradingView trade 2/,
+    );
+    assert.equal(existsSync(join(root, 'research', 'trades', 'malformed-closed.csv')), false);
   });
 
   for (const [label, type, rendered] of [
