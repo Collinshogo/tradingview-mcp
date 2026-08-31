@@ -576,7 +576,11 @@ export function buildFullTradesJS() {
           // object.  Exclude only that shape.  Once an exit object exists, treat
           // the row as closed and fail on missing close fields instead of hiding
           // a malformed/partial closed trade behind the count reconciliation.
-          if (!Object.prototype.hasOwnProperty.call(tr, 'exit') || tr.exit == null) {
+          var exitAbsent = !Object.prototype.hasOwnProperty.call(tr, 'exit') || tr.exit == null;
+          var exitIncomplete = !exitAbsent && (typeof tr.exit !== 'object' || Array.isArray(tr.exit)
+            || tr.exit.time == null || tr.exit.price == null);
+          var isSingleExtraTerminal = i === source.length - 1 && source.length === total + 1;
+          if ((exitAbsent || exitIncomplete) && isSingleExtraTerminal) {
             openSkipped++;
             continue;
           }

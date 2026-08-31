@@ -125,7 +125,7 @@ describe('data_export_trades_csv', () => {
 
   it('exports authoritative closed trades while excluding a structurally open terminal row', () => {
     const openTrade = rawTrade(3, 'le');
-    delete openTrade.exit;
+    openTrade.exit = {};
     delete openTrade.profit;
     const pageResult = evalPageScript(
       buildFullTradesJS(),
