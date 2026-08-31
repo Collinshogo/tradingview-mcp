@@ -18,6 +18,13 @@ import * as data from './data.js';
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const DEEP_END_POLICIES = new Set(['through_latest', 'exact']);
+function isIsoDate(value) {
+  if (typeof value !== 'string' || !ISO_DATE_RE.test(value)) return false;
+  const time = Date.parse(value + 'T00:00:00.000Z');
+  return Number.isFinite(time) && new Date(time).toISOString().slice(0, 10) === value;
+}
 function fmtChip(iso) {
   const [y, m, d] = iso.split('-').map(Number);
   return MONTHS[m - 1] + ' ' + d + ', ' + y;
@@ -26,6 +33,30 @@ function plusOneDay(iso) {
   const [y, m, d] = iso.split('-').map(Number);
   const dt = new Date(Date.UTC(y, m - 1, d + 1));
   return dt.toISOString().slice(0, 10);
+}
+
+/**
+ * TradingView owns the latest available end date. A caller-supplied end is
+ * explicit only when it is a valid historical date strictly before that end;
+ * nominal/current/future values must never be typed into the picker.
+ */
+export function resolveDeepRangeEnd(requestedEnd, availableEnd, endPolicy = 'through_latest') {
+  const requested = isIsoDate(requestedEnd) ? requestedEnd : null;
+  const available = isIsoDate(availableEnd) ? availableEnd : null;
+  if (!DEEP_END_POLICIES.has(endPolicy)) {
+    return { explicit: false, effective_end: null, error: 'Unsupported deep end policy: ' + endPolicy };
+  }
+  if (endPolicy === 'through_latest') {
+    return available
+      ? { explicit: false, effective_end: available }
+      : { explicit: false, effective_end: null, error: 'TradingView latest-available end date was not readable' };
+  }
+  if (!requested) return { explicit: false, effective_end: null, error: 'end_policy=exact requires a YYYY-MM-DD `to` date' };
+  if (!available) return { explicit: false, effective_end: null, error: 'TradingView latest-available end date was not readable' };
+  if (requested > available) {
+    return { explicit: false, effective_end: null, error: 'Exact end ' + requested + ' is after TradingView latest available ' + available };
+  }
+  return { explicit: requested < available, effective_end: requested };
 }
 
 /** Poll study input registration without ever writing an empty snapshot. */
@@ -293,73 +324,238 @@ async function typeDateField(idx, val, commitKey) {
   return true;
 }
 
-async function setRangeAndSelect(from, to) {
+export async function setRangeAndSelect(from, to, endPolicy = 'through_latest', _deps) {
+  const deps = {
+    evaluate: _deps?.evaluate || evaluate,
+    typeDateField: _deps?.typeDateField || typeDateField,
+    delay: _deps?.delay || delay,
+    clickSelect: _deps?.clickSelect || clickSelect,
+    closeDialogIfOpen: _deps?.closeDialogIfOpen || closeDialogIfOpen,
+    clickTesterChip: _deps?.clickTesterChip || clickTesterChip,
+    clickCustomRange: _deps?.clickCustomRange || clickCustomRange,
+  };
   // ⛔ COLLIN RULING 2026-08-10 ("set the start date only and hit select — the other date is
   // automatically set", repeated four times before it landed HERE, in the tool, where the
   // typing actually happens): the END field is left completely untouched unless the caller
-  // asks for a SHORTER window than the dialog already shows. The dialog pre-fills the end
+  // explicitly sets end_policy=exact for a historical window. The dialog pre-fills the end
   // with the last date TV can actually serve; the old code typed the caller's `to` into it
   // first thing, and any date past the last bar (a UTC-rolled "today" being the recurring
   // case) leaves Select DISABLED — the dialog then sits open, both retry rounds and the
   // whole poll budget burn away, and from outside it looks like a frozen desktop. The model
   // could never fix this from the prompt side because the typing lives here, not there.
   for (let attempt = 0; attempt < 2; attempt++) {
-    const pre = await evaluate(READ_DATES_JS);
+    const pre = await deps.evaluate(READ_DATES_JS);
     const preEnd = pre && pre[1];
-    // ISO YYYY-MM-DD compares lexicographically == chronologically. Only type the end
-    // field when the requested end is STRICTLY EARLIER than what the dialog offers
-    // (a deliberately shorter window). Requested end at-or-past the offered end means
-    // "run to the last available bar" — exactly what the untouched field already does.
-    const typeEnd = !!(preEnd && to && to < preEnd);
-    const effTo = typeEnd ? to : (preEnd || to);
-    if (typeEnd) {
-      await typeDateField(1, to, 'Tab');
-      await delay(250);
+    const endSelection = resolveDeepRangeEnd(to, preEnd, endPolicy);
+    if (endSelection.error) {
+      return { ok: false, fatal: true, why: endSelection.error, v0: pre && pre[0], v1: preEnd };
     }
-    await typeDateField(0, from, 'Tab');
-    await delay(300);
-    const vals = await evaluate(READ_DATES_JS);
+    if (!endSelection.effective_end) {
+      await deps.delay(300);
+      continue;
+    }
+    // ISO YYYY-MM-DD compares lexicographically == chronologically. Only type the end
+    // field when the requested end is STRICTLY EARLIER than what TradingView offers.
+    // Every nominal/current/future end leaves TradingView's latest date untouched.
+    if (endSelection.explicit) {
+      await deps.typeDateField(1, to, 'Tab');
+      await deps.delay(250);
+    }
+    await deps.typeDateField(0, from, 'Tab');
+    await deps.delay(300);
+    const vals = await deps.evaluate(READ_DATES_JS);
     if (vals === null) {
       // dialog already closed (submitted) — treat as applied, poll verifies range
-      return { ok: true, v0: from, v1: effTo, note: 'submitted-on-type' };
+      return { ok: true, v0: from, v1: endSelection.effective_end, explicit_end: endSelection.explicit, end_policy: endPolicy, note: 'submitted-on-type' };
     }
-    if (vals[0] === from && (!typeEnd || vals[1] === to)) {
-      const clicked = await clickSelect();
+    if (vals[0] === from && (!endSelection.explicit || vals[1] === to)) {
+      const clicked = await deps.clickSelect();
       if (clicked) {
-        await delay(800);
-        const still = await evaluate(READ_DATES_JS);
-        return { ok: true, v0: vals[0], v1: vals[1], note: still === null ? 'select-closed' : 'select-clicked' };
+        await deps.delay(800);
+        const still = await deps.evaluate(READ_DATES_JS);
+        return { ok: true, v0: vals[0], v1: vals[1], explicit_end: endSelection.explicit, end_policy: endPolicy, note: still === null ? 'select-closed' : 'select-clicked' };
       }
       // Select styled-disabled — commit via Enter on the start field instead
-      await typeDateField(0, from, 'Enter');
-      await delay(800);
-      const gone = await evaluate(READ_DATES_JS);
-      if (gone === null) return { ok: true, v0: from, v1: vals[1], note: 'enter-submitted' };
+      await deps.typeDateField(0, from, 'Enter');
+      await deps.delay(800);
+      const gone = await deps.evaluate(READ_DATES_JS);
+      if (gone === null) return { ok: true, v0: from, v1: vals[1], explicit_end: endSelection.explicit, end_policy: endPolicy, note: 'enter-submitted' };
     }
     // values didn't land — reopen dialog and retry once
-    await closeDialogIfOpen();
-    await delay(500);
-    await clickTesterChip();
-    await delay(600);
-    await clickCustomRange();
-    await delay(600);
+    await deps.closeDialogIfOpen();
+    await deps.delay(500);
+    await deps.clickTesterChip();
+    await deps.delay(600);
+    await deps.clickCustomRange();
+    await deps.delay(600);
   }
-  const finalVals = await evaluate(READ_DATES_JS);
+  const finalVals = await deps.evaluate(READ_DATES_JS);
   return { ok: false, why: 'typed dates did not stick', v0: finalVals && finalVals[0], v1: finalVals && finalVals[1] };
 }
 
-async function clickUpdateReportIfStale() {
-  return evaluate(`
+const TERMINAL_DEEP_ERROR_RE = /\bruntime error\b|\berror on bar \d+\b|\bdeep backtest(?:ing)?\b.{0,240}\b(?:error|failed|failure|unavailable)\b|\b(?:error|failed|failure)\b.{0,240}\bdeep backtest(?:ing)?\b|\b(?:strategy )?report(?: generation)?\b.{0,240}\b(?:error|failed|failure)\b|\b(?:error|failed|failure)\b.{0,240}\b(?:strategy )?report(?: generation)?\b/i;
+const RETRYABLE_DEEP_MESSAGE_RE = /\b(?:not computed yet|retry in a few seconds|still loading|pending|not-generated|report is outdated)\b/i;
+
+function terminalMessage(value) {
+  const text = value instanceof Error ? value.message : value;
+  return typeof text === 'string' ? text.replace(/\s+/g, ' ').trim().slice(0, 1000) : '';
+}
+
+/** Classify only terminal deep/report failures; pending/not-computed remains retryable. */
+export function terminalDeepReportError({ report, ui, thrown } = {}) {
+  const runtimeMessage = terminalMessage(report?.runtime_error);
+  if (runtimeMessage) return { source: 'report', message: runtimeMessage };
+  const explicitReportMessage = terminalMessage(report?.report_error);
+  if (explicitReportMessage) return { source: 'report', message: explicitReportMessage };
+
+  const status = String(report?.deep_status || '').toLowerCase();
+  const genericError = terminalMessage(report?.error);
+  const warning = terminalMessage(report?.warning);
+  if (status === 'error') {
+    return {
+      source: 'deep-status',
+      message: [genericError, warning].find((message) => TERMINAL_DEEP_ERROR_RE.test(message))
+        || warning
+        || genericError
+        || 'TradingView reported a terminal Deep Backtesting error.',
+    };
+  }
+  if (status === 'loading' || status === 'not-generated') return null;
+  if (genericError && !RETRYABLE_DEEP_MESSAGE_RE.test(genericError)) {
+    return { source: 'report', message: genericError };
+  }
+  if (warning && TERMINAL_DEEP_ERROR_RE.test(warning) && !RETRYABLE_DEEP_MESSAGE_RE.test(warning)) {
+    return { source: 'report', message: warning };
+  }
+
+  const uiMessage = terminalMessage(ui?.terminal_error);
+  if (uiMessage) return { source: 'visible-ui', message: uiMessage };
+
+  const thrownMessage = terminalMessage(thrown);
+  if (thrownMessage && TERMINAL_DEEP_ERROR_RE.test(thrownMessage)) {
+    return { source: 'report-read', message: thrownMessage };
+  }
+  return null;
+}
+
+export function buildDeepReportUiStateJS() {
+  return `
     (function() {
-      var outdated = /report is outdated/i.test(document.body.innerText);
-      var btns = document.querySelectorAll('button');
+      var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
+      var widget = null;
+      try { if (bwb && typeof bwb.getWidgetByName === 'function') widget = bwb.getWidgetByName('backtesting'); } catch (e) {}
+      if (!widget && bwb && bwb._widgets) widget = bwb._widgets['backtesting'];
+      var panel = (widget && widget._container)
+        || document.querySelector('[data-name="backtesting"]')
+        || document.querySelector('[class*="strategyReport"]');
+      if (!panel || panel.offsetParent === null) return { outdated: false, clicked: false, panel_found: false };
+      var panelText = panel.innerText || '';
+      var outdated = /report is outdated/i.test(panelText);
+      var terminal = null;
+      var alerts = panel.querySelectorAll('[role="alert"], [aria-live="assertive"]');
+      for (var a = 0; a < alerts.length && !terminal; a++) {
+        if (alerts[a].offsetParent === null) continue;
+        var alertText = (alerts[a].innerText || alerts[a].textContent || '').replace(/\\s+/g, ' ').trim();
+        if (/runtime error|error on bar \\d+|deep backtest(?:ing)?.*(?:error|failed|failure|unavailable)|(?:strategy )?report(?: generation)?.*(?:error|failed|failure)/i.test(alertText)) terminal = alertText.slice(0, 1000);
+      }
+      if (!terminal) {
+        var lines = panelText.split(/\\r?\\n/);
+        for (var l = 0; l < lines.length; l++) {
+          var line = lines[l].replace(/\\s+/g, ' ').trim();
+          if (/^(?:runtime error\\b|error on bar \\d+\\b|deep backtest(?:ing)?\\b.*\\b(?:error|failed|failure|unavailable)\\b|(?:strategy )?report(?: generation)?\\b.*\\b(?:error|failed|failure)\\b)/i.test(line)) {
+            terminal = (line + (lines[l + 1] ? ' ' + lines[l + 1].trim() : '')).slice(0, 1000);
+            break;
+          }
+        }
+      }
+      var btns = panel.querySelectorAll('button');
+      if (outdated) {
+        for (var u = 0; u < btns.length; u++) {
+          var updateText = (btns[u].textContent || '').trim();
+          if (/^Update report$/i.test(updateText) && btns[u].offsetParent !== null && !btns[u].disabled) { btns[u].click(); return { outdated: true, clicked: true }; }
+        }
+        return { outdated: true, clicked: false };
+      }
+      if (terminal) return { outdated: false, clicked: false, terminal_error: terminal };
       for (var i = 0; i < btns.length; i++) {
         var t = (btns[i].textContent || '').trim();
         if (/^Update report$/i.test(t) && btns[i].offsetParent !== null && !btns[i].disabled) { btns[i].click(); return { outdated: outdated, clicked: true }; }
       }
       return { outdated: outdated, clicked: false };
     })()
-  `);
+  `;
+}
+
+async function clickUpdateReportIfStale() {
+  return evaluate(buildDeepReportUiStateJS());
+}
+
+function matchesArmedDeepRange(report, from, armedTo) {
+  if (!report || report.success === false || report.report_type !== 'deep' || !report.date_range) return false;
+  if (!isIsoDate(armedTo) || report.date_range.from !== from) return false;
+  return report.date_range.to === armedTo || report.date_range.to === plusOneDay(armedTo);
+}
+
+/** Poll one armed deep range and stop as soon as TradingView exposes a terminal failure. */
+export async function pollDeepReport({ from, armedTo, timeoutMs, _deps } = {}) {
+  const deps = {
+    updateReport: _deps?.updateReport || clickUpdateReportIfStale,
+    getStrategyResults: _deps?.getStrategyResults || ((options) => data.getStrategyResults(options)),
+    withDeadline: _deps?.withDeadline || withDeadline,
+    isDeadlineExceeded: _deps?.isDeadlineExceeded || isDeadlineExceeded,
+    delay: _deps?.delay || delay,
+    now: _deps?.now || (() => Date.now()),
+  };
+  const budget = Math.max(1, Number(timeoutMs) || 1);
+  const deadline = deps.now() + budget;
+  let last = null;
+
+  while (deps.now() < deadline) {
+    let remaining = deadline - deps.now();
+    if (remaining <= 0) break;
+
+    let ui;
+    try {
+      ui = await deps.withDeadline(() => deps.updateReport(), remaining, 'deepRun.poll.update');
+    } catch (error) {
+      if (deps.isDeadlineExceeded(error)) throw error;
+      const terminal = terminalDeepReportError({ thrown: error });
+      if (terminal) return { status: 'terminal', error: terminal.message, terminal_source: terminal.source, last };
+      throw error;
+    }
+    const visibleTerminal = terminalDeepReportError({ ui });
+    if (visibleTerminal) {
+      return { status: 'terminal', error: visibleTerminal.message, terminal_source: visibleTerminal.source, last };
+    }
+    if (ui?.clicked) {
+      const settle = Math.min(750, Math.max(0, deadline - deps.now()));
+      if (settle > 0) await deps.delay(settle);
+    }
+
+    remaining = deadline - deps.now();
+    if (remaining <= 0) break;
+    try {
+      last = await deps.withDeadline(
+        () => deps.getStrategyResults({ timeoutMs: remaining }),
+        remaining,
+        'deepRun.poll.data',
+      );
+      const reportTerminal = terminalDeepReportError({ report: last });
+      if (reportTerminal) {
+        return { status: 'terminal', error: reportTerminal.message, terminal_source: reportTerminal.source, last };
+      }
+      if (matchesArmedDeepRange(last, from, armedTo)) return { status: 'matched', last };
+    } catch (error) {
+      if (deps.isDeadlineExceeded(error)) throw error;
+      const terminal = terminalDeepReportError({ thrown: error });
+      if (terminal) return { status: 'terminal', error: terminal.message, terminal_source: terminal.source, last };
+      // A transient report read remains retryable while the advertised budget remains.
+    }
+
+    const pause = Math.min(3000, Math.max(0, deadline - deps.now()));
+    if (pause > 0) await deps.delay(pause);
+  }
+  return { status: 'timeout', last };
 }
 
 async function removeStrategyStudies() {
@@ -524,7 +720,16 @@ export async function publishFile({ path, name }) {
 
 // ── deepRun ─────────────────────────────────────────────────────────────────
 
-export async function deepRun({ script_name, timeframe, from, to, inputs, poll_seconds = 90 }) {
+export async function deepRun({ script_name, timeframe, from, to, end_policy = 'through_latest', inputs, poll_seconds = 90 }) {
+  if (!isIsoDate(from)) {
+    return { success: false, stage: 'precheck', error: '`from` must be a real YYYY-MM-DD calendar date' };
+  }
+  if (!DEEP_END_POLICIES.has(end_policy)) {
+    return { success: false, stage: 'precheck', error: 'Unsupported deep end policy: ' + end_policy };
+  }
+  if (end_policy === 'exact' && !isIsoDate(to)) {
+    return { success: false, stage: 'precheck', error: 'end_policy=exact requires a YYYY-MM-DD `to` date' };
+  }
   if (timeframe) await chart.setTimeframe({ timeframe });
 
   // one strategy at a time
@@ -580,7 +785,7 @@ export async function deepRun({ script_name, timeframe, from, to, inputs, poll_s
     }
   }
 
-  // Arm-and-verify rounds: the picker sometimes drops the END date at Select
+  // Arm-and-verify rounds: the picker sometimes fails to commit the range at Select
   // (first-attempt failure is common; a re-armed second attempt sticks). Each
   // round: open picker -> stepwise set/fix dates -> Select -> poll the SERVED
   // report and require the exact range on both ends before accepting.
@@ -597,38 +802,42 @@ export async function deepRun({ script_name, timeframe, from, to, inputs, poll_s
     await delay(700);
     await clickCustomRange();
     await delay(700);
-    lastSet = await setRangeAndSelect(from, to);
-    if (!(lastSet && lastSet.ok)) { await delay(1000); continue; }
+    lastSet = await setRangeAndSelect(from, to, end_policy);
+    if (!(lastSet && lastSet.ok)) {
+      if (lastSet?.fatal) return { success: false, stage: 'range', error: lastSet.why, last_set: lastSet };
+      await delay(1000);
+      continue;
+    }
     // The range actually ARMED may end earlier than the caller's nominal `to` (the
     // set-start-only rule leaves the dialog's own last-available end in place). Verify
     // the served report against what was armed (lastSet.v1), not the nominal ask —
     // otherwise a successful run through the real last bar reads as a poll failure.
     const effTo = (lastSet && lastSet.v1) || to;
 
-    const deadline = Date.now() + perRoundPoll * 1000;
-    while (Date.now() < deadline) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) break;
-      await withDeadline(() => clickUpdateReportIfStale(), remaining, 'deepRun.poll.update');
-      const pause = Math.min(3000, Math.max(0, deadline - Date.now()));
-      if (pause > 0) await delay(pause);
-      const dataRemaining = deadline - Date.now();
-      if (dataRemaining <= 0) break;
-      try {
-        last = await withDeadline(() => data.getStrategyResults({ timeoutMs: dataRemaining }), dataRemaining, 'deepRun.poll.data');
-        if (
-          last && last.success !== false && last.report_type === 'deep' &&
-          last.date_range && last.date_range.from === from &&
-          (last.date_range.to === effTo || last.date_range.to === plusOneDay(effTo) ||
-           last.date_range.to === to || last.date_range.to === plusOneDay(to))
-        ) {
-          return { success: true, cleared_strategies: cleared && cleared.removed, entity_id: entityId, rounds: round + 1, served_to: last.date_range.to, requested_to: to, ...last };
-        }
-      } catch (e) {
-        if (isDeadlineExceeded(e)) throw e;
-        // A transient report read can be retried while the advertised poll
-        // budget remains; deadline failures are terminal and never swallowed.
-      }
+    const polled = await pollDeepReport({
+      from,
+      armedTo: effTo,
+      timeoutMs: perRoundPoll * 1000,
+    });
+    last = polled.last || last;
+    if (polled.status === 'terminal') {
+      return {
+        success: false,
+        stage: 'poll',
+        terminal: true,
+        terminal_source: polled.terminal_source,
+        error: polled.error,
+        end_policy,
+        requested_to: to,
+        armed_to: effTo,
+        deep_status: last?.deep_status,
+        warning: last?.warning,
+        last_range: last?.date_range,
+        last_set: lastSet,
+      };
+    }
+    if (polled.status === 'matched') {
+      return { success: true, cleared_strategies: cleared && cleared.removed, entity_id: entityId, rounds: round + 1, served_to: last.date_range.to, requested_to: to, end_policy, ...last };
     }
   }
   return { success: false, stage: 'poll', error: 'Exact-range deep report not served in time', last_range: last && last.date_range, last_set: lastSet };

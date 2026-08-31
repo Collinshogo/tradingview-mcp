@@ -12,7 +12,11 @@ import {
   acquireLease, withLease, runExclusive, isLeaseBusy,
 } from '../src/lease.js';
 import { runtimeIdentity } from '../src/core/health.js';
-import { waitForAttachedStrategy, waitForStudyInputs } from '../src/core/composite.js';
+import { registerCompositeTools } from '../src/tools/composite.js';
+import {
+  buildDeepReportUiStateJS, pollDeepReport, resolveDeepRangeEnd, setRangeAndSelect,
+  waitForAttachedStrategy, waitForStudyInputs,
+} from '../src/core/composite.js';
 
 test('withDeadline rejects a never-resolving operation with stage and timeout', async () => {
   await assert.rejects(
@@ -197,6 +201,273 @@ test('missing attached strategy times out fail-closed', async () => {
   });
   assert.equal(attached.ok, false);
   assert.equal(attached.reason, 'timeout');
+});
+
+function rangePickerHarness(initialValues) {
+  let values = [...initialValues];
+  let closed = false;
+  const typed = [];
+  return {
+    typed,
+    deps: {
+      evaluate: async () => closed ? null : [...values],
+      typeDateField: async (index, value, commitKey) => {
+        typed.push({ index, value, commitKey });
+        values[index] = value;
+        return true;
+      },
+      delay: async () => {},
+      clickSelect: async () => { closed = true; return true; },
+      closeDialogIfOpen: async () => { closed = true; return true; },
+      clickTesterChip: async () => { closed = false; return true; },
+      clickCustomRange: async () => true,
+    },
+  };
+}
+
+test('nominal/current deep end leaves TradingView latest available end untouched', async () => {
+  assert.deepEqual(resolveDeepRangeEnd('2026-08-30', '2026-08-31', 'through_latest'), {
+    explicit: false,
+    effective_end: '2026-08-31',
+  });
+  const harness = rangePickerHarness(['2025-01-01', '2026-08-31']);
+  const selected = await setRangeAndSelect('2026-01-01', '2026-08-30', 'through_latest', harness.deps);
+  assert.equal(selected.ok, true);
+  assert.equal(selected.v1, '2026-08-31');
+  assert.equal(selected.explicit_end, false);
+  assert.equal(selected.end_policy, 'through_latest');
+  assert.deepEqual(harness.typed, [
+    { index: 0, value: '2026-01-01', commitKey: 'Tab' },
+  ]);
+});
+
+test('strict historical deep end is typed before the start date', async () => {
+  assert.deepEqual(resolveDeepRangeEnd('2026-08-30', '2026-08-31', 'exact'), {
+    explicit: true,
+    effective_end: '2026-08-30',
+  });
+  assert.deepEqual(resolveDeepRangeEnd('2026-08-31', '2026-08-31', 'exact'), {
+    explicit: false,
+    effective_end: '2026-08-31',
+  });
+  const harness = rangePickerHarness(['2025-01-01', '2026-08-31']);
+  const selected = await setRangeAndSelect('2026-01-01', '2026-08-30', 'exact', harness.deps);
+  assert.equal(selected.ok, true);
+  assert.equal(selected.v1, '2026-08-30');
+  assert.equal(selected.explicit_end, true);
+  assert.equal(selected.end_policy, 'exact');
+  assert.deepEqual(harness.typed, [
+    { index: 1, value: '2026-08-30', commitKey: 'Tab' },
+    { index: 0, value: '2026-01-01', commitKey: 'Tab' },
+  ]);
+});
+
+test('exact deep end rejects invalid or beyond-latest dates before typing', async () => {
+  assert.match(resolveDeepRangeEnd('2026-00-15', '2026-08-31', 'exact').error, /requires a YYYY-MM-DD/);
+  assert.match(resolveDeepRangeEnd('2026-09-01', '2026-08-31', 'exact').error, /after TradingView latest/);
+  const harness = rangePickerHarness(['2025-01-01', '2026-08-31']);
+  const selected = await setRangeAndSelect('2026-01-01', '2026-00-15', 'exact', harness.deps);
+  assert.equal(selected.ok, false);
+  assert.equal(selected.fatal, true);
+  assert.deepEqual(harness.typed, []);
+});
+
+test('public deep-run tool defaults to through_latest and requires opt-in exact policy', () => {
+  let registration = null;
+  registerCompositeTools({
+    tool: (name, description, schema, handler) => {
+      if (name === 'strategy_deep_run') registration = { description, schema, handler };
+    },
+  });
+  assert.ok(registration);
+  assert.equal(registration.schema.end_policy.parse(undefined), 'through_latest');
+  assert.equal(registration.schema.end_policy.parse('exact'), 'exact');
+  assert.equal(registration.schema.to.parse(undefined), undefined);
+  assert.throws(() => registration.schema.end_policy.parse('compare_dates'));
+  assert.match(registration.description, /START-DATE-ONLY/);
+});
+
+test('deep polling accepts only the armed TradingView end convention, not an arbitrary nominal end', async () => {
+  let reads = 0;
+  const reports = [
+    { success: true, report_type: 'deep', date_range: { from: '2026-01-01', to: '2026-09-01' } },
+    { success: true, report_type: 'deep', date_range: { from: '2026-01-01', to: '2026-08-29' } },
+  ];
+  const result = await pollDeepReport({
+    from: '2026-01-01',
+    armedTo: '2026-08-29',
+    timeoutMs: 1000,
+    _deps: {
+      updateReport: async () => ({ outdated: false, clicked: false }),
+      getStrategyResults: async () => reports[reads++],
+      delay: async () => {},
+    },
+  });
+  assert.equal(result.status, 'matched');
+  assert.equal(reads, 2);
+  assert.equal(result.last.date_range.to, '2026-08-29');
+});
+
+test('deep polling accepts TradingView exclusive end at exactly armed end plus one day', async () => {
+  let reads = 0;
+  const result = await pollDeepReport({
+    from: '2026-01-01',
+    armedTo: '2026-12-31',
+    timeoutMs: 1000,
+    _deps: {
+      updateReport: async () => ({ outdated: false, clicked: false }),
+      getStrategyResults: async () => {
+        reads++;
+        return { success: true, report_type: 'deep', date_range: { from: '2026-01-01', to: '2027-01-01' } };
+      },
+      delay: async () => {},
+    },
+  });
+  assert.equal(result.status, 'matched');
+  assert.equal(reads, 1);
+});
+
+function executeDeepReportUiState({ panelText = '', alertText = '', buttons = [] } = {}) {
+  const alerts = alertText ? [{ offsetParent: {}, innerText: alertText, textContent: alertText }] : [];
+  const panel = {
+    offsetParent: {},
+    innerText: panelText,
+    querySelectorAll: (selector) => selector === 'button' ? buttons : alerts,
+  };
+  const window = {
+    TradingView: {
+      bottomWidgetBar: { getWidgetByName: () => ({ _container: panel }) },
+    },
+  };
+  const document = { querySelector: () => { throw new Error('active widget container should win'); } };
+  return Function('window', 'document', `return (${buildDeepReportUiStateJS()});`)(window, document);
+}
+
+test('visible deep errors are panel-scoped and stale errors do not block Update report', () => {
+  const source = buildDeepReportUiStateJS();
+  assert.doesNotMatch(source, /document\.body/);
+  let clicks = 0;
+  const stale = executeDeepReportUiState({
+    panelText: 'Report is outdated\nRuntime error from prior report',
+    alertText: 'Runtime error from prior report',
+    buttons: [{ textContent: 'Update report', offsetParent: {}, disabled: false, click: () => { clicks++; } }],
+  });
+  assert.deepEqual(stale, { outdated: true, clicked: true });
+  assert.equal(clicks, 1);
+
+  const fresh = executeDeepReportUiState({
+    panelText: 'Runtime error',
+    alertText: 'Runtime error: array index is out of bounds',
+  });
+  assert.equal(fresh.clicked, false);
+  assert.match(fresh.terminal_error, /Runtime error/);
+});
+
+test('an Update report click settles before the first deep report read', async () => {
+  const events = [];
+  const result = await pollDeepReport({
+    from: '2026-01-01',
+    armedTo: '2026-08-29',
+    timeoutMs: 1000,
+    _deps: {
+      updateReport: async () => { events.push('update'); return { outdated: true, clicked: true }; },
+      getStrategyResults: async () => {
+        events.push('read');
+        return { success: true, report_type: 'deep', date_range: { from: '2026-01-01', to: '2026-08-29' } };
+      },
+      delay: async (ms) => { events.push(`delay:${ms}`); },
+    },
+  });
+  assert.equal(result.status, 'matched');
+  assert.deepEqual(events, ['update', 'delay:750', 'read']);
+});
+
+test('deep polling returns terminal report/runtime errors on the first observation', async (t) => {
+  const cases = [
+    {
+      name: 'deep status error',
+      ui: { outdated: false, clicked: false },
+      report: { success: false, deep_status: 'error', warning: 'Deep Backtesting report failed.' },
+      source: 'deep-status',
+      reads: 1,
+    },
+    {
+      name: 'structured runtime error field',
+      ui: { outdated: false, clicked: false },
+      report: { success: false, runtime_error: 'array index is out of bounds' },
+      source: 'report',
+      reads: 1,
+    },
+    {
+      name: 'structured report error field',
+      ui: { outdated: false, clicked: false },
+      report: { success: false, report_error: 'backend unavailable' },
+      source: 'report',
+      reads: 1,
+    },
+    {
+      name: 'non-pending generic error',
+      ui: { outdated: false, clicked: false },
+      report: { success: false, error: 'No strategy found on chart.' },
+      source: 'report',
+      reads: 1,
+    },
+    {
+      name: 'visible report error',
+      ui: { outdated: false, clicked: false, terminal_error: 'Strategy report generation failed.' },
+      report: { success: false, error: 'Strategy report not computed yet. Retry in a few seconds.' },
+      source: 'visible-ui',
+      reads: 0,
+    },
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      let reads = 0;
+      const result = await pollDeepReport({
+        from: '2026-01-01',
+        armedTo: '2026-08-29',
+        timeoutMs: 1000,
+        _deps: {
+          updateReport: async () => item.ui,
+          getStrategyResults: async () => { reads++; return item.report; },
+          delay: async () => {},
+        },
+      });
+      assert.equal(result.status, 'terminal');
+      assert.equal(result.terminal_source, item.source);
+      assert.equal(typeof result.error, 'string');
+      assert.ok(result.error.length > 0);
+      assert.equal(reads, item.reads);
+    });
+  }
+});
+
+test('pending deep report remains retryable before the armed report arrives', async () => {
+  let reads = 0;
+  const result = await pollDeepReport({
+    from: '2026-01-01',
+    armedTo: '2026-08-29',
+    timeoutMs: 1000,
+    _deps: {
+      updateReport: async () => ({ outdated: false, clicked: false }),
+      getStrategyResults: async () => {
+        reads++;
+        if (reads === 1) {
+          return {
+            success: false,
+            deep_status: 'loading',
+            error: 'Strategy report not computed yet. Retry in a few seconds.',
+            warning: 'Deep Backtesting mode is ON but the deep report is not available (loading).',
+          };
+        }
+        return { success: true, report_type: 'deep', date_range: { from: '2026-01-01', to: '2026-08-29' } };
+      },
+      delay: async () => {},
+    },
+  });
+  assert.equal(result.status, 'matched');
+  assert.equal(reads, 2);
 });
 
 test('exclusive process mode protects direct connection imports until owner exit', async () => {
