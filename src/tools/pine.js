@@ -2,7 +2,20 @@ import { z } from 'zod';
 import { jsonResult } from './_format.js';
 import * as core from '../core/pine.js';
 
-export function registerPineTools(server) {
+function resolveOpenScriptName({ name, script_name } = {}) {
+  const canonical = typeof name === 'string' ? name.trim() : '';
+  const compatibility = typeof script_name === 'string' ? script_name.trim() : '';
+
+  if (!canonical && !compatibility) {
+    throw new Error('pine_open requires one nonblank script name via "name" or "script_name".');
+  }
+  if (canonical && compatibility && canonical.toLowerCase() !== compatibility.toLowerCase()) {
+    throw new Error('pine_open received conflicting "name" and "script_name" values; refusing to choose a script.');
+  }
+  return canonical || compatibility;
+}
+
+export function registerPineTools(server, { openScript = core.openScript } = {}) {
   server.tool('pine_get_source', 'Get current Pine Script source code from the editor', {}, async () => {
     try { return jsonResult(await core.getSource()); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
@@ -53,9 +66,13 @@ export function registerPineTools(server) {
   });
 
   server.tool('pine_open', 'Open a saved Pine Script by name — actually switches the visible editor to that script (verified against the editor\'s own state). Discards any unsaved edits in the editor (like TradingView itself).', {
-    name: z.string().describe('Name of the saved script to open (case-insensitive match)'),
-  }, async ({ name }) => {
-    try { return jsonResult(await core.openScript({ name })); }
+    name: z.string().optional().describe('Canonical name of the saved script to open (case-insensitive match)'),
+    script_name: z.string().optional().describe('Compatibility alias for name; if both are supplied they must identify the same script'),
+  }, async ({ name, script_name }) => {
+    try {
+      const resolvedName = resolveOpenScriptName({ name, script_name });
+      return jsonResult(await openScript({ name: resolvedName }));
+    }
     catch (err) { return jsonResult({ success: false, source: 'editor_facade', error: err.message }, true); }
   });
 

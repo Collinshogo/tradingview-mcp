@@ -15,6 +15,7 @@ import {
 import { runtimeIdentity } from '../src/core/health.js';
 import { registerCompositeTools } from '../src/tools/composite.js';
 import { registerChartTools } from '../src/tools/chart.js';
+import { registerPineTools } from '../src/tools/pine.js';
 import {
   buildDeepReportUiStateJS, buildClickAddToChartJS, buildReadStrategiesJS, compactVerifiedInputs, pollDeepReport,
   resolveDeepRangeEnd, setRangeAndSelect, clickAddToChart, matchAttachedStrategy, waitForAttachedStrategy,
@@ -577,6 +578,61 @@ test('chart_manage_indicator exposes only the built-in study route', () => {
   assert.match(registration.description, /built-in/i);
   assert.equal(registration.schema.source.parse(undefined), 'built_in');
   assert.throws(() => registration.schema.source.parse('my_scripts'));
+});
+
+test('pine_open accepts canonical name and script_name alias, then passes one resolved name to core', async () => {
+  let registration = null;
+  const calls = [];
+  registerPineTools({
+    tool: (name, description, schema, handler) => {
+      if (name === 'pine_open') registration = { description, schema, handler };
+    },
+  }, {
+    openScript: async (args) => {
+      calls.push(args);
+      return { success: true, opened: args.name };
+    },
+  });
+
+  assert.ok(registration);
+  assert.equal(registration.schema.name.parse(undefined), undefined);
+  assert.equal(registration.schema.script_name.parse(undefined), undefined);
+
+  const canonical = await registration.handler({ name: '  AFT Canonical  ' });
+  assert.equal(canonical.isError, undefined);
+  assert.deepEqual(calls.at(-1), { name: 'AFT Canonical' });
+
+  const alias = await registration.handler({ script_name: '  AFT Alias  ' });
+  assert.equal(alias.isError, undefined);
+  assert.deepEqual(calls.at(-1), { name: 'AFT Alias' });
+
+  const equivalent = await registration.handler({ name: 'AFT Same', script_name: ' aft same ' });
+  assert.equal(equivalent.isError, undefined);
+  assert.deepEqual(calls.at(-1), { name: 'AFT Same' });
+  assert.equal(calls.length, 3);
+});
+
+test('pine_open fails closed for missing, blank, or conflicting names without calling core', async () => {
+  let handler = null;
+  let calls = 0;
+  registerPineTools({
+    tool: (name, description, schema, callback) => { if (name === 'pine_open') handler = callback; },
+  }, {
+    openScript: async () => { calls++; return { success: true }; },
+  });
+
+  for (const args of [
+    {},
+    { name: '   ', script_name: '\t' },
+    { name: 'AFT One', script_name: 'AFT Two' },
+  ]) {
+    const result = await handler(args);
+    assert.equal(result.isError, true);
+    const payload = JSON.parse(result.content[0].text);
+    assert.equal(payload.success, false);
+    assert.match(payload.error, /requires one nonblank|conflicting/);
+  }
+  assert.equal(calls, 0);
 });
 
 test('deep polling accepts only the armed TradingView end convention, not an arbitrary nominal end', async () => {
