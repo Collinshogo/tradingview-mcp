@@ -73,12 +73,54 @@ const defaultDeps = {
 export function buildPineTabFallbackJS() {
   return `
     (function() {
-      var btn = document.querySelector('[aria-label="Pine"]')
-        || document.querySelector('[data-name="pine-dialog-button"]');
-      if (!btn || btn.offsetParent === null) return false;
+      var candidates = [];
+      var selectors = [
+        '[aria-label="Pine"]',
+        '[aria-label="Pine Editor"]',
+        '[data-name="pine-dialog-button"]',
+        'button[data-name="pine-editor"]',
+        '[role="tab"][data-name="pine-editor"]'
+      ];
+      function addCandidate(el) {
+        if (el && candidates.indexOf(el) === -1) candidates.push(el);
+      }
+      function anyVisible(selector) {
+        var matches = document.querySelectorAll(selector);
+        for (var i = 0; i < matches.length; i++) {
+          if (matches[i].offsetParent !== null) return true;
+        }
+        return false;
+      }
+      for (var s = 0; s < selectors.length; s++) {
+        var matches = document.querySelectorAll(selectors[s]);
+        for (var m = 0; m < matches.length; m++) addCandidate(matches[m]);
+      }
+      var textCandidates = document.querySelectorAll('button, [role="tab"], [role="button"]');
+      for (var i = 0; i < textCandidates.length; i++) {
+        var text = (textCandidates[i].textContent || '').trim().toLowerCase();
+        if (text === 'pine' || text === 'pine editor') addCandidate(textCandidates[i]);
+      }
+      var btn = null;
+      for (var c = 0; c < candidates.length; c++) {
+        if (candidates[c].offsetParent !== null) {
+          btn = candidates[c];
+          break;
+        }
+      }
+      if (!btn) return false;
+      if (anyVisible('[data-qa-id="pine-editor"], .monaco-editor.pine-editor-monaco')) return false;
       var selected = btn.getAttribute('aria-selected');
       var expanded = btn.getAttribute('aria-expanded');
-      if (selected !== 'false' && expanded !== 'false') return false;
+      var pressed = btn.getAttribute('aria-pressed');
+      var classes = String(btn.className || '');
+      if (selected === 'true' || expanded === 'true' || pressed === 'true'
+          || /(^|[\s_-])(is)?active([\s_-]|$)/i.test(classes)
+          || /(^|[\s_-])selected([\s_-]|$)/i.test(classes)) return false;
+      var explicitlyInactive = selected === 'false' || expanded === 'false' || pressed === 'false';
+      var bottomArea = document.querySelector('[class*="layout__area--bottom"]');
+      var collapsed = !!(bottomArea && bottomArea.offsetHeight <= 50);
+      var otherPanelVisible = anyVisible('[data-name="backtesting"], [class*="strategyReport"]');
+      if (!explicitlyInactive && !collapsed && !otherPanelVisible) return false;
       btn.click();
       return true;
     })()
@@ -119,18 +161,35 @@ export async function ensurePineEditorOpen(deps = defaultDeps) {
     })()
   `);
 
+  for (let i = 0; i < 10; i++) {
+    await deps.delay(200);
+    const ready = await deps.evaluate(`(function() { return ${FIND_MONACO} !== null; })()`);
+    if (ready) return true;
+  }
+
+  // Some TradingView builds expose both methods but leave
+  // activateScriptEditorTab() as a no-op when Strategy Tester owns the bottom
+  // panel. showWidget() is idempotent and must be attempted before a DOM click.
+  await deps.evaluate(`
+    (function() { /* tv-mcp:show-pine-editor */
+      var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
+      if (!bwb || typeof bwb.showWidget !== 'function') return false;
+      bwb.showWidget('pine-editor');
+      return true;
+    })()
+  `);
+
   for (let i = 0; i < 15; i++) {
     await deps.delay(200);
     const ready = await deps.evaluate(`(function() { return ${FIND_MONACO} !== null; })()`);
     if (ready) return true;
   }
 
-  // The internal activator can report success before rendering. Fall back only
-  // when the Pine tab explicitly says it is inactive; active or unknown state
-  // must not receive a second click that could toggle the panel closed.
+  // Last resort: one visible Pine-tab click, guarded against an already-active
+  // tab or visible editor panel so this cannot toggle the editor closed.
   await deps.evaluate(buildPineTabFallbackJS());
 
-  for (let i = 0; i < 35; i++) {
+  for (let i = 0; i < 25; i++) {
     await deps.delay(200);
     const ready = await deps.evaluate(`(function() { return ${FIND_MONACO} !== null; })()`);
     if (ready) return true;

@@ -295,16 +295,73 @@ describe('ensurePineEditorOpen — single activation path', () => {
     assert.equal(fallbackClicks, 1);
   });
 
-  it('DOM fallback clicks only an explicitly inactive Pine tab', () => {
-    const run = (attrs) => {
+  it('uses idempotent showWidget when the internal activator is a no-op', async () => {
+    let shown = false;
+    let fallbackClicks = 0;
+    const opened = await ensurePineEditorOpen({
+      delay: async () => {},
+      evaluate: async (expr) => {
+        if (expr.includes('tv-mcp:show-pine-editor')) { shown = true; return true; }
+        if (expr.includes('activateScriptEditorTab')) return true;
+        if (expr.includes('aria-selected')) { fallbackClicks++; return true; }
+        if (expr.includes('findMonacoEditor')) return shown;
+        return null;
+      },
+    });
+    assert.equal(opened, true);
+    assert.equal(shown, true);
+    assert.equal(fallbackClicks, 0);
+  });
+
+  it('DOM fallback clicks only a safely inactive Pine tab and chooses a visible duplicate', () => {
+    const run = (attrs, className = '', options = {}) => {
       let clicks = 0;
-      const button = { offsetParent: {}, getAttribute: (name) => attrs[name] || null, click: () => { clicks++; } };
-      const result = runInNewContext(buildPineTabFallbackJS(), { document: { querySelector: () => button } });
+      const button = {
+        offsetParent: options.hidden ? null : {},
+        className,
+        textContent: 'Pine Editor',
+        getAttribute: (name) => attrs[name] || null,
+        click: () => { clicks++; },
+      };
+      const visibleDuplicate = options.visibleDuplicate ? {
+        ...button,
+        offsetParent: {},
+        click: () => { clicks++; },
+      } : null;
+      const bottomArea = options.noBottomArea ? null : { offsetHeight: options.bottomHeight ?? 0 };
+      const hiddenPanel = { offsetParent: null };
+      const otherPanels = options.otherPanel
+        ? [...(options.hiddenOtherFirst ? [hiddenPanel] : []), { offsetParent: {} }]
+        : [];
+      const visiblePanels = options.visiblePanel
+        ? [...(options.hiddenPineFirst ? [hiddenPanel] : []), { offsetParent: {} }]
+        : [];
+      const result = runInNewContext(buildPineTabFallbackJS(), {
+        document: {
+          querySelectorAll: (selector) => {
+            if (selector === '[aria-label="Pine"]') return [button, ...(visibleDuplicate ? [visibleDuplicate] : [])];
+            if (selector.includes('data-qa-id="pine-editor"')) return visiblePanels;
+            if (selector.includes('data-name="backtesting"')) return otherPanels;
+            return [];
+          },
+          querySelector: (selector) => {
+            if (selector.includes('layout__area--bottom')) return bottomArea;
+            return null;
+          },
+        },
+      });
       return { result, clicks };
     };
     assert.deepEqual(run({ 'aria-selected': 'false' }), { result: true, clicks: 1 });
     assert.deepEqual(run({ 'aria-selected': 'true' }), { result: false, clicks: 0 });
-    assert.deepEqual(run({}), { result: false, clicks: 0 });
+    assert.deepEqual(run({}), { result: true, clicks: 1 });
+    assert.deepEqual(run({}, 'tab isActive'), { result: false, clicks: 0 });
+    assert.deepEqual(run({}, '', { bottomHeight: 300 }), { result: false, clicks: 0 });
+    assert.deepEqual(run({}, '', { bottomHeight: 300, otherPanel: true }), { result: true, clicks: 1 });
+    assert.deepEqual(run({}, '', { bottomHeight: 300, otherPanel: true, hiddenOtherFirst: true }), { result: true, clicks: 1 });
+    assert.deepEqual(run({}, '', { hidden: true, visibleDuplicate: true }), { result: true, clicks: 1 });
+    assert.deepEqual(run({ 'aria-selected': 'false' }, '', { visiblePanel: true }), { result: false, clicks: 0 });
+    assert.deepEqual(run({ 'aria-selected': 'false' }, '', { visiblePanel: true, hiddenPineFirst: true }), { result: false, clicks: 0 });
   });
 });
 
