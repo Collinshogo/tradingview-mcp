@@ -566,7 +566,8 @@ function parseToolResult(result, callIndex, tool) {
 
 function requireToolSuccess(parsedResult, callIndex, tool) {
   if (parsedResult.is_error) {
-    throw new RunnerError('TOOL_IS_ERROR', `${tool} returned isError=true.`, { call_index: callIndex, tool });
+    const detail = typeof parsedResult.parsed.error === 'string' ? `: ${parsedResult.parsed.error}` : '.';
+    throw new RunnerError('TOOL_IS_ERROR', `${tool} returned isError=true${detail}`, { call_index: callIndex, tool });
   }
   if (parsedResult.parsed.success !== true) {
     throw new RunnerError(
