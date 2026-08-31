@@ -35,6 +35,7 @@ export const Q525_ALLOWED_TOOLS = Object.freeze([
   'chart_set_timeframe',
   'pine_open',
   'pine_get_source_info',
+  'pine_publish_file',
   'strategy_deep_run',
   'data_export_trades_csv',
 ]);

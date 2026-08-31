@@ -171,13 +171,13 @@ function fakeSession({ tools, responses = {}, hang = new Set(), trace = [] }) {
   };
 }
 
-test('hard allowlist excludes dangerous mutation, UI-eval, alert, launch, and update tools', () => {
+test('hard allowlist permits verified file publish but excludes unbounded mutation, UI-eval, alert, launch, and update tools', () => {
   assert.deepEqual(Q525_ALLOWED_TOOLS, [
     'tv_health_check', 'alert_list', 'chart_get_state', 'chart_set_symbol', 'chart_set_timeframe',
-    'pine_open', 'pine_get_source_info', 'strategy_deep_run', 'data_export_trades_csv',
+    'pine_open', 'pine_get_source_info', 'pine_publish_file', 'strategy_deep_run', 'data_export_trades_csv',
   ]);
   for (const blocked of [
-    'ui_eval', 'pine_set_source', 'pine_smart_compile', 'pine_save', 'pine_publish_file', 'pine_new',
+    'ui_eval', 'pine_set_source', 'pine_smart_compile', 'pine_save', 'pine_new',
     'alert_create', 'alert_delete', 'tv_launch', 'tv_update',
   ]) {
     assert.throws(
