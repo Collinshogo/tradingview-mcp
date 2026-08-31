@@ -152,7 +152,9 @@ describe('fingerprintSource', () => {
     assert.equal(lf.normalized_lf_utf8_sha256, crlf.normalized_lf_utf8_sha256);
     assert.notEqual(lf.raw_utf8_sha256, crlf.raw_utf8_sha256);
     assert.notEqual(lf.raw_utf8_byte_count, crlf.raw_utf8_byte_count);
-    assert.equal(crlf.line_count, 4);
+    assert.equal(lf.line_count, 3);
+    assert.equal(crlf.line_count, 3);
+    assert.equal(fingerprintSource('//@version=6\n// Build 42\nplot(close)').line_count, 3);
   });
 
   it('hashes UTF-8 bytes and returns bounded, numbered build markers', () => {

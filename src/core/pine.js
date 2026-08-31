@@ -190,6 +190,9 @@ export function fingerprintSource(source) {
   const hash = (value) => createHash('sha256').update(Buffer.from(value, 'utf8')).digest('hex');
   const markerMatches = [];
   const lines = normalized.split('\n');
+  // Match editor/file line-number conventions: a terminal newline terminates
+  // the last content line; it does not create a phantom extra blank line.
+  const lineCount = normalized === '' ? 0 : lines.length - (normalized.endsWith('\n') ? 1 : 0);
   for (let index = 0; index < lines.length && markerMatches.length < 20; index++) {
     const line = lines[index];
     if (/\bbuild\s+\d+\b/i.test(line) || /\bb\s*=\s*\d+\b/i.test(line)) {
@@ -202,7 +205,7 @@ export function fingerprintSource(source) {
     normalized_lf_utf8_sha256: hash(normalized),
     raw_utf8_byte_count: Buffer.byteLength(source, 'utf8'),
     normalized_lf_utf8_byte_count: Buffer.byteLength(normalized, 'utf8'),
-    line_count: lines.length,
+    line_count: lineCount,
     build_markers: markerMatches,
   };
 }
