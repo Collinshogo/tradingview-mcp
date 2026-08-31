@@ -4,6 +4,7 @@
  * They throw on error (callers catch and format).
  */
 import { evaluate, evaluateAsync, getClient, withDeadline, DEFAULT_DEADLINE_MS } from '../connection.js';
+import { createHash } from 'node:crypto';
 
 // ── Monaco finder (injected into TV page) ──
 const FIND_MONACO = `
@@ -174,6 +175,37 @@ export function pickScriptRecord(scripts, name) {
 }
 
 // ── Pure / offline functions ──
+
+/**
+ * Produce a compact fingerprint of editor source without returning its contents.
+ * Hashes are computed from exact UTF-8 runtime editor bytes and a separately
+ * LF-normalized UTF-8 representation; neither establishes Git provenance.
+ */
+export function fingerprintSource(source) {
+  if (typeof source !== 'string') {
+    throw new TypeError('Pine source must be a string.');
+  }
+
+  const normalized = source.replace(/\r\n|\r/g, '\n');
+  const hash = (value) => createHash('sha256').update(Buffer.from(value, 'utf8')).digest('hex');
+  const markerMatches = [];
+  const lines = normalized.split('\n');
+  for (let index = 0; index < lines.length && markerMatches.length < 20; index++) {
+    const line = lines[index];
+    if (/\bbuild\s+\d+\b/i.test(line) || /\bb\s*=\s*\d+\b/i.test(line)) {
+      markerMatches.push({ line: index + 1, text: line.slice(0, 240) });
+    }
+  }
+
+  return {
+    raw_utf8_sha256: hash(source),
+    normalized_lf_utf8_sha256: hash(normalized),
+    raw_utf8_byte_count: Buffer.byteLength(source, 'utf8'),
+    normalized_lf_utf8_byte_count: Buffer.byteLength(normalized, 'utf8'),
+    line_count: lines.length,
+    build_markers: markerMatches,
+  };
+}
 
 export function analyze({ source }) {
   const lines = source.split('\n');
@@ -370,6 +402,63 @@ export async function getSource({ _deps } = {}) {
     char_count: source.length,
     script_id: active?.script_id ?? null,
     script_name: active?.script_name ?? null,
+  };
+}
+
+/**
+ * Read and fingerprint the visible Monaco source while keeping the source out
+ * of the response. The active editor identity is required to prevent a hash
+ * from being reported for an unverifiable script.
+ */
+export async function getSourceInfo({ _deps } = {}) {
+  const deps = { ...defaultDeps, ..._deps };
+  const editorReady = await ensurePineEditorOpen(deps);
+  if (!editorReady) throw new Error('Could not open Pine Editor or Monaco not found in React fiber tree.');
+
+  // Source and store identity must come from one synchronous page snapshot.
+  // Separate CDP reads can bind script A's source to script B's identity when
+  // the editor changes between calls.
+  const snapshot = await deps.evaluate(`
+    (function() { /* tv-mcp:source-info */
+      var m = ${FIND_MONACO};
+      var parts = ${FIND_EDITOR_PARTS};
+      if (!m || !parts) return null;
+      var s = parts.store.getState().script || {};
+      return {
+        source: m.editor.getValue(),
+        active: {
+          script_id: s.scriptIdPart || null,
+          script_name: s.scriptName || null,
+          script_title: s.scriptTitle || null,
+          version: s.version || null,
+          editor_title: (parts.titleButton.textContent || '').trim()
+        }
+      };
+    })()
+  `);
+  const source = snapshot?.source;
+  if (typeof source !== 'string' || source.trim() === '') {
+    throw new Error('Monaco editor source is unreadable — refusing to report a fingerprint.');
+  }
+
+  const active = snapshot.active;
+  const hasSavedId = typeof active?.script_id === 'string' && active.script_id.trim() !== '';
+  const hasStoreName = [
+    active?.script_name,
+    active?.script_title,
+  ].some(value => typeof value === 'string' && value.trim() !== '');
+  if (!hasSavedId || !hasStoreName) {
+    throw new Error('Active saved Pine script identity is unreadable — refusing to report a fingerprint.');
+  }
+
+  return {
+    success: true,
+    ...fingerprintSource(source),
+    script_id: active.script_id ?? null,
+    script_name: active.script_name ?? null,
+    script_title: active.script_title ?? null,
+    editor_title: active.editor_title ?? null,
+    version: active.version ?? null,
   };
 }
 

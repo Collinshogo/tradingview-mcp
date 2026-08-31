@@ -25,6 +25,7 @@ const READ_ONLY_TOOLS = new Set([
   'tv_health_check', 'tv_discover', 'tv_ui_state', 'chart_get_state', 'chart_get_visible_range',
   'symbol_info', 'symbol_search', 'data_get_study_values', 'data_get_ohlcv', 'data_get_pine_lines',
   'data_get_pine_labels', 'data_get_pine_tables', 'data_get_pine_boxes', 'pine_get_source',
+  'pine_get_source_info',
   'pine_get_errors', 'pine_get_console', 'pine_list_scripts', 'pine_analyze', 'pine_check', 'draw_list',
   'draw_get', 'replay_status', 'alert_list', 'watchlist_get', 'layout_list', 'tab_list', 'pane_list',
 ]);
@@ -123,6 +124,7 @@ Changing the chart:
 Pine Script development:
 - pine_set_source → inject code, pine_smart_compile → compile + check errors
 - pine_get_errors → read errors, pine_get_console → read log output
+- pine_get_source_info → verify a saved script's identity, build markers, and source hashes without returning the source
 - WARNING: pine_get_source can return 200KB+ for complex scripts — avoid unless editing
 
 Screenshots: capture_screenshot → regions: "full", "chart", "strategy_tester"

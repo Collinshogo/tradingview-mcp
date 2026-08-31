@@ -26,6 +26,8 @@ import {
   setSource,
   ensurePineEditorOpen,
   buildPineTabFallbackJS,
+  fingerprintSource,
+  getSourceInfo,
   pickScriptRecord,
   _resetEditorTargetState,
 } from '../src/core/pine.js';
@@ -55,15 +57,17 @@ function activeOf(rec) {
  */
 function mockDeps({ scripts = [], active = [null], editorValue = '', openResult = { ok: true }, newResult = { ok: true } } = {}) {
   const state = { writes: [], openCalls: [], newCalls: [], activeReads: 0 };
+  const nextActive = () => {
+    const value = active[Math.min(state.activeReads, active.length - 1)];
+    state.activeReads++;
+    return value;
+  };
   const deps = {
     delay: async () => {},
     evaluate: async (expr) => {
       // tv-mcp:* markers first — those expressions embed FIND_MONACO too.
-      if (expr.includes('tv-mcp:active-script')) {
-        const v = active[Math.min(state.activeReads, active.length - 1)];
-        state.activeReads++;
-        return v;
-      }
+      if (expr.includes('tv-mcp:source-info')) return { source: editorValue, active: nextActive() };
+      if (expr.includes('tv-mcp:active-script')) return nextActive();
       if (expr.includes('tv-mcp:set-source')) { state.writes.push(expr); return true; }
       if (expr.includes('tv-mcp:editor-value')) return editorValue;
       if (expr.includes('tv-mcp:line-count')) return editorValue ? editorValue.split('\n').length : 1;
@@ -138,6 +142,72 @@ describe('openScript — really switches the editor', () => {
   it('surfaces a page-side facade error', async () => {
     const { deps } = mockDeps({ scripts: [SCRIPT_A], openResult: { error: 'Pine editor facade not found — is the Pine Editor open and its script-title button visible?' } });
     await assert.rejects(() => openScript({ name: 'AFT A1 Cascade', _deps: deps }), /facade not found/);
+  });
+});
+
+describe('fingerprintSource', () => {
+  it('normalizes CRLF for the normalized hash while preserving the raw-byte distinction', () => {
+    const lf = fingerprintSource('//@version=6\n// Build 42\nplot(close)\n');
+    const crlf = fingerprintSource('//@version=6\r\n// Build 42\r\nplot(close)\r\n');
+    assert.equal(lf.normalized_lf_utf8_sha256, crlf.normalized_lf_utf8_sha256);
+    assert.notEqual(lf.raw_utf8_sha256, crlf.raw_utf8_sha256);
+    assert.notEqual(lf.raw_utf8_byte_count, crlf.raw_utf8_byte_count);
+    assert.equal(crlf.line_count, 4);
+  });
+
+  it('hashes UTF-8 bytes and returns bounded, numbered build markers', () => {
+    const longText = `// b=7 ${'x'.repeat(300)}`;
+    const source = ['//@version=6', '// BUILD 123', 'title = "café"', longText, 'b = 88'].join('\n');
+    const result = fingerprintSource(source);
+    assert.equal(result.raw_utf8_byte_count, Buffer.byteLength(source, 'utf8'));
+    assert.equal(result.normalized_lf_utf8_byte_count, Buffer.byteLength(source, 'utf8'));
+    assert.deepEqual(result.build_markers.map(m => m.line), [2, 4, 5]);
+    assert.equal(result.build_markers[1].text.length, 240);
+    assert.ok(!Object.hasOwn(result, 'source'));
+  });
+
+  it('caps build markers at twenty', () => {
+    const result = fingerprintSource(Array.from({ length: 25 }, (_, i) => `// build ${i}`).join('\n'));
+    assert.equal(result.build_markers.length, 20);
+    assert.equal(result.build_markers[19].line, 20);
+  });
+});
+
+describe('getSourceInfo', () => {
+  it('returns active editor identity and never returns the source', async () => {
+    const source = '//@version=6\n// build 900\nplot(close)';
+    const { deps, state } = mockDeps({ active: [activeOf(SCRIPT_B)], editorValue: source });
+    const result = await getSourceInfo({ _deps: deps });
+    assert.equal(result.success, true);
+    assert.equal(result.script_id, SCRIPT_B.scriptIdPart);
+    assert.equal(result.script_name, SCRIPT_B.scriptName);
+    assert.equal(result.script_title, SCRIPT_B.scriptTitle);
+    assert.equal(result.editor_title, SCRIPT_B.scriptName);
+    assert.equal(result.version, SCRIPT_B.version);
+    assert.ok(!Object.hasOwn(result, 'source'));
+    assert.equal(state.activeReads, 1, 'source and identity must be captured by one page snapshot');
+  });
+
+  it('fails closed when source is unreadable, empty, or transiently blank', async () => {
+    const noSource = mockDeps({ active: [activeOf(SCRIPT_A)], editorValue: null });
+    await assert.rejects(() => getSourceInfo({ _deps: noSource.deps }), /source is unreadable/);
+    const emptySource = mockDeps({ active: [activeOf(SCRIPT_A)], editorValue: '' });
+    await assert.rejects(() => getSourceInfo({ _deps: emptySource.deps }), /source is unreadable/);
+    const blankSource = mockDeps({ active: [activeOf(SCRIPT_A)], editorValue: ' \r\n\t' });
+    await assert.rejects(() => getSourceInfo({ _deps: blankSource.deps }), /source is unreadable/);
+  });
+
+  it('requires a saved id and a store-backed name, not a cosmetic editor title', async () => {
+    const noIdentity = mockDeps({ active: [null], editorValue: 'plot(close)' });
+    await assert.rejects(() => getSourceInfo({ _deps: noIdentity.deps }), /saved Pine script identity is unreadable/);
+    const blankIdentity = mockDeps({ active: [{}], editorValue: 'plot(close)' });
+    await assert.rejects(() => getSourceInfo({ _deps: blankIdentity.deps }), /saved Pine script identity is unreadable/);
+    const cosmeticOnly = mockDeps({ active: [{ editor_title: 'Loading…' }], editorValue: 'plot(close)' });
+    await assert.rejects(() => getSourceInfo({ _deps: cosmeticOnly.deps }), /saved Pine script identity is unreadable/);
+    const unsavedName = mockDeps({ active: [DRAFT], editorValue: 'plot(close)' });
+    await assert.rejects(() => getSourceInfo({ _deps: unsavedName.deps }), /saved Pine script identity is unreadable/);
+    const idOnly = mockDeps({ active: [{ script_id: SCRIPT_A.scriptIdPart }], editorValue: 'plot(close)' });
+    await assert.rejects(() => getSourceInfo({ _deps: idOnly.deps }), /saved Pine script identity is unreadable/);
   });
 });
 

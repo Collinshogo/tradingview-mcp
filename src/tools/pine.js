@@ -8,6 +8,11 @@ export function registerPineTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
+  server.tool('pine_get_source_info', 'Get a compact fingerprint and verified saved-script identity for the current Pine editor source without returning source text. Fails closed for drafts, blank/transient source, or unreadable identity. Reports SHA-256 of exact runtime editor UTF-8 bytes and separately LF-normalized UTF-8 bytes; hashes are not Git blob provenance by themselves.', {}, async () => {
+    try { return jsonResult(await core.getSourceInfo()); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
   server.tool('pine_set_source', 'Set Pine Script source code in the editor. Refuses to write if the editor is showing a different script than the last pine_open/pine_new target (prevents cross-script clobber).', {
     source: z.string().describe('Pine Script source code to inject'),
   }, async ({ source }) => {
