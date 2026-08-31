@@ -84,11 +84,17 @@ export async function setType({ chart_type, _deps }) {
   return { success: true, chart_type, type_num: typeNum };
 }
 
-export async function manageIndicator({ action, indicator, entity_id, inputs: inputsRaw, _deps }) {
+export async function manageIndicator({ action, indicator, entity_id, inputs: inputsRaw, source = 'built_in', _deps }) {
   const { evaluate } = _resolve(_deps);
   const inputs = inputsRaw ? (typeof inputsRaw === 'string' ? JSON.parse(inputsRaw) : inputsRaw) : undefined;
 
   if (action === 'add') {
+    // createStudy is the TradingView built-in-study API route. `source` is an
+    // explicit caller declaration, not proof that an arbitrary name is not a
+    // saved script; saved strategies must use strategy_deep_run instead.
+    if (source !== 'built_in') {
+      throw new Error('chart_manage_indicator only adds built-in studies. Use strategy_deep_run for a saved My Scripts strategy.');
+    }
     const before = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
     await evaluate(`
       (function() {
@@ -140,6 +146,7 @@ export async function manageIndicator({ action, indicator, entity_id, inputs: in
       success: newIds.length > 0,
       action: 'add',
       indicator,
+      requested_source: source,
       entity_id: entityId,
       new_study_count: newIds.length,
       ...(appliedInputs && { inputs: appliedInputs }),

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { runInNewContext } from 'node:vm';
 import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,9 +14,11 @@ import {
 } from '../src/lease.js';
 import { runtimeIdentity } from '../src/core/health.js';
 import { registerCompositeTools } from '../src/tools/composite.js';
+import { registerChartTools } from '../src/tools/chart.js';
 import {
-  buildDeepReportUiStateJS, compactVerifiedInputs, pollDeepReport, resolveDeepRangeEnd, setRangeAndSelect,
-  waitForAttachedStrategy, waitForStudyInputs,
+  buildDeepReportUiStateJS, buildClickAddToChartJS, buildReadStrategiesJS, compactVerifiedInputs, pollDeepReport,
+  resolveDeepRangeEnd, setRangeAndSelect, clickAddToChart, matchAttachedStrategy, waitForAttachedStrategy,
+  waitForNoStrategyStudies, waitForStudyInputs,
 } from '../src/core/composite.js';
 
 test('withDeadline rejects a never-resolving operation with stage and timeout', async () => {
@@ -172,13 +175,14 @@ test('verified input receipt retains only requested overrides', () => {
 test('slow Pine compile is polled until one attached strategy appears', async () => {
   let evaluations = 0;
   const attached = await waitForAttachedStrategy({
-    scriptName: 'MYM Session ORB Chassis', timeoutMs: 100,
+    scriptName: 'MYM Session ORB Chassis', expectedTarget: { scriptIdPart: 'USER;orb' }, timeoutMs: 100,
     evaluateFn: async () => {
       evaluations++;
       return evaluations < 4 ? [] : [{
         id: 'strategy-1',
         description: 'MYM Session ORB Chassis',
         short_description: 'MYM-ORB',
+        pine_script_id: 'USER;orb',
       }];
     },
     delayFn: async () => {},
@@ -187,6 +191,252 @@ test('slow Pine compile is polled until one attached strategy appears', async ()
   assert.equal(attached.entity_id, 'strategy-1');
   assert.equal(attached.name_match, true);
   assert.equal(evaluations, 4);
+});
+
+test('existing strategy removal is polled to zero before a saved script can be added', async () => {
+  let reads = 0;
+  const removed = await waitForNoStrategyStudies({
+    timeoutMs: 100,
+    evaluateFn: async () => (++reads < 3 ? [{ id: 'old-strategy', description: 'Old strategy' }] : []),
+    delayFn: async () => {},
+  });
+  assert.equal(removed.ok, true);
+  assert.equal(removed.zero_snapshots, 2);
+  assert.equal(reads, 4);
+});
+
+test('a transient empty removal scan followed by old-strategy reappearance cannot authorize Add', async () => {
+  const snapshots = [
+    [],
+    [{ id: 'old-strategy', description: 'Old strategy' }],
+    [],
+    [],
+  ];
+  let reads = 0;
+  const removed = await waitForNoStrategyStudies({
+    timeoutMs: 100,
+    evaluateFn: async () => snapshots[Math.min(reads++, snapshots.length - 1)],
+    delayFn: async () => {},
+  });
+  assert.equal(removed.ok, true);
+  assert.equal(reads, 4);
+  assert.equal(removed.zero_snapshots, 2);
+});
+
+test('a transient thrown removal scan retries before stable zero authorization', async () => {
+  let reads = 0;
+  const removed = await waitForNoStrategyStudies({
+    timeoutMs: 100,
+    evaluateFn: async () => {
+      if (++reads === 1) throw new Error('execution context destroyed');
+      return [];
+    },
+    delayFn: async () => {},
+  });
+  assert.equal(removed.ok, true);
+  assert.equal(reads, 3);
+});
+
+test('an unreadable post-removal strategy scan fails closed', async () => {
+  const removed = await waitForNoStrategyStudies({
+    timeoutMs: 100,
+    evaluateFn: async () => ({ ok: false, error: 'chart detached', strategies: [] }),
+    delayFn: async () => {},
+  });
+  assert.equal(removed.ok, false);
+  assert.equal(removed.reason, 'unreadable');
+  assert.match(removed.error, /chart detached/);
+});
+
+test('a sole attached strategy with a mismatched name and no matching Pine id is rejected', async () => {
+  const attached = await waitForAttachedStrategy({
+    scriptName: 'AFT Target',
+    expectedTarget: { script_id: 'USER;target', title: 'Target title' },
+    timeoutMs: 100,
+    evaluateFn: async () => [{ id: 'strategy-1', description: 'Wrong strategy', short_description: 'Wrong', pine_script_id: 'USER;wrong' }],
+    delayFn: async () => {},
+  });
+  assert.equal(attached.ok, false);
+  assert.equal(attached.reason, 'identity_mismatch');
+  assert.equal(attached.name_match, false);
+  assert.equal(attached.id_match, false);
+});
+
+test('matching titles without an exposed Pine script id are identity-unverifiable', () => {
+  const matched = matchAttachedStrategy(
+    { title: 'AFT Target — v2' },
+    { scriptName: 'saved-file-name', expectedTarget: { scriptIdPart: 'USER;target', title: 'AFT Target — v2' } },
+  );
+  assert.equal(matched.ok, false);
+  assert.equal(matched.name_match, true);
+  assert.equal(matched.reason, 'identity_unverifiable');
+});
+
+test('matching Pine script id positively identifies the sole attached strategy', () => {
+  const matched = matchAttachedStrategy(
+    { pine_script_id: 'USER;target' },
+    { scriptName: 'saved-file-name', expectedTarget: { scriptIdPart: 'USER;target' } },
+  );
+  assert.equal(matched.ok, true);
+  assert.equal(matched.name_match, false);
+  assert.equal(matched.id_match, true);
+});
+
+test('a mismatched Pine script id rejects a coincidentally matching strategy title', () => {
+  assert.deepEqual(
+    matchAttachedStrategy(
+      { title: 'AFT Target', pine_script_id: 'USER;wrong' },
+      { scriptName: 'AFT Target', expectedTarget: { script_id: 'USER;target', title: 'AFT Target' } },
+    ),
+    { ok: false, name_match: true, id_match: false, reason: 'identity_mismatch', identity_error: undefined },
+  );
+});
+
+test('attachment polling survives unreadable, blank, and mismatch snapshots until an ID match arrives', async () => {
+  const snapshots = [
+    { ok: false, error: 'panel rerender', strategies: [] },
+    [],
+    [{ id: 'wrong', title: 'AFT Target', pine_script_id: 'USER;wrong' }],
+    [{ id: 'right', title: 'AFT Target', pine_script_id: 'USER;target' }],
+  ];
+  let reads = 0;
+  const attached = await waitForAttachedStrategy({
+    scriptName: 'AFT Target', expectedTarget: { scriptIdPart: 'USER;target' }, timeoutMs: 100,
+    evaluateFn: async () => snapshots[Math.min(reads++, snapshots.length - 1)], delayFn: async () => {},
+  });
+  assert.equal(attached.ok, true);
+  assert.equal(attached.entity_id, 'right');
+  assert.equal(reads, 4);
+});
+
+test('attachment polling retries a thrown evaluation before the correct entity appears', async () => {
+  let reads = 0;
+  const attached = await waitForAttachedStrategy({
+    scriptName: 'AFT Target', expectedTarget: { scriptIdPart: 'USER;target' }, timeoutMs: 100,
+    evaluateFn: async () => {
+      if (++reads === 1) throw new Error('execution context destroyed');
+      return [{ id: 'new-entity', pine_script_id: 'USER;target' }];
+    },
+    delayFn: async () => {},
+  });
+  assert.equal(attached.ok, true);
+  assert.equal(attached.entity_id, 'new-entity');
+  assert.equal(reads, 2);
+});
+
+test('a matching saved-script ID on a removed entity ID is rejected until a new entity appears', async () => {
+  const snapshots = [
+    [{ id: 'old-entity', pine_script_id: 'USER;target' }],
+    [{ id: 'new-entity', pine_script_id: 'USER;target' }],
+  ];
+  let reads = 0;
+  const attached = await waitForAttachedStrategy({
+    scriptName: 'AFT Target', expectedTarget: { scriptIdPart: 'USER;target' }, forbiddenEntityIds: ['old-entity'], timeoutMs: 100,
+    evaluateFn: async () => snapshots[Math.min(reads++, snapshots.length - 1)], delayFn: async () => {},
+  });
+  assert.equal(attached.ok, true);
+  assert.equal(attached.entity_id, 'new-entity');
+  assert.equal(reads, 2);
+});
+
+function domElement({ text = '', attrs = {}, parent = null } = {}) {
+  return {
+    textContent: text,
+    offsetParent: {},
+    disabled: false,
+    className: '',
+    clicked: 0,
+    getAttribute(name) { return attrs[name] || null; },
+    closest() { return parent; },
+    click() { this.clicked++; },
+  };
+}
+
+function runAddDom({ controls = [], icons = [], direct = null, outsideIcons = [] } = {}) {
+  const root = domElement();
+  root.querySelector = () => direct;
+  root.querySelectorAll = (selector) => selector.includes('button') ? controls : icons;
+  const document = {
+    querySelector(selector) { return selector === '[data-qa-id="pine-editor"]' ? root : null; },
+    querySelectorAll() { throw new Error('document-wide fallback is forbidden'); },
+  };
+  const result = runInNewContext(buildClickAddToChartJS(), { document });
+  return { result, root, outsideIcons };
+}
+
+test('saved-script Add discovery executes title/ARIA and icon fallbacks only inside Pine editor', () => {
+  const titled = domElement({ attrs: { title: 'Add script to chart' } });
+  const outside = domElement({ attrs: { 'data-icon': 'add-script-to-chart' } });
+  const titleRun = runAddDom({ controls: [titled], outsideIcons: [outside] });
+  assert.equal(titleRun.result.clicked, true);
+  assert.equal(titleRun.result.selector_kind, 'text_title_aria');
+  assert.equal(titled.clicked, 1);
+  assert.equal(outside.clicked, 0);
+
+  const iconButton = domElement();
+  const icon = domElement({ attrs: { 'data-icon': 'add-script-to-chart' }, parent: iconButton });
+  const iconRun = runAddDom({ icons: [icon] });
+  assert.equal(iconRun.result.clicked, true);
+  assert.equal(iconRun.result.selector_kind, 'icon');
+  assert.equal(iconButton.clicked, 1);
+
+  const bareButton = domElement();
+  const bareIcon = domElement({ attrs: { 'data-icon': 'add' }, parent: bareButton });
+  const bareRun = runAddDom({ icons: [bareIcon] });
+  assert.equal(bareRun.result.clicked, false);
+  assert.equal(bareButton.clicked, 0);
+});
+
+test('clickAddToChart exposes selector telemetry', async () => {
+  const added = await clickAddToChart({ timeoutMs: 100, evaluateFn: async () => ({ clicked: true, selector_kind: 'qa' }), delayFn: async () => {} });
+  assert.deepEqual(added, { clicked: true, selector_kind: 'qa' });
+});
+
+test('clickAddToChart retries thrown evaluations and retains failure diagnostics', async () => {
+  let reads = 0;
+  const added = await clickAddToChart({
+    timeoutMs: 100,
+    evaluateFn: async () => {
+      if (++reads === 1) throw new Error('editor rerender');
+      return { clicked: true, selector_kind: 'qa' };
+    },
+    delayFn: async () => {},
+  });
+  assert.equal(added.clicked, true);
+  assert.equal(reads, 2);
+
+  const failed = await clickAddToChart({
+    timeoutMs: 5,
+    evaluateFn: async () => { throw new Error('editor detached'); },
+    delayFn: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  });
+  assert.equal(failed.clicked, false);
+  assert.match(failed.error, /editor detached/);
+});
+
+test('strategy scan never converts a source extraction failure into readable-empty', () => {
+  const broken = {
+    metaInfo() { return { isTVScriptStrategy: true }; },
+    reportData() {},
+    id() { throw new Error('source id unavailable'); },
+  };
+  const context = { window: { TradingViewApi: { _activeChartWidgetWV: { value: () => ({ _chartWidget: { model: () => ({ model: () => ({ dataSources: () => [broken] }) }) } }) } } } };
+  const result = runInNewContext(buildReadStrategiesJS(), context);
+  assert.equal(result.ok, false);
+  assert.equal(result.source_index, 0);
+  assert.match(result.error, /source id unavailable/);
+});
+
+test('strategy scan preserves a detected strategy whose identity getter fails', () => {
+  const source = {
+    metaInfo() { return { isTVScriptStrategy: true, description: 'Target', get scriptIdPart() { throw new Error('blocked id'); } }; },
+    reportData() {}, id() { return 'strategy-1'; },
+  };
+  const context = { window: { TradingViewApi: { _activeChartWidgetWV: { value: () => ({ _chartWidget: { model: () => ({ model: () => ({ dataSources: () => [source] }) }) } }) } } } };
+  const result = runInNewContext(buildReadStrategiesJS(), context);
+  assert.equal(result.ok, true);
+  assert.equal(result.strategies.length, 1);
+  assert.match(result.strategies[0].identity_error, /blocked id/);
 });
 
 test('multiple attached strategies fail closed as ambiguous', async () => {
@@ -210,7 +460,7 @@ test('missing attached strategy times out fail-closed', async () => {
     delayFn: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   });
   assert.equal(attached.ok, false);
-  assert.equal(attached.reason, 'timeout');
+  assert.equal(attached.reason, 'blank');
 });
 
 function rangePickerHarness(initialValues) {
@@ -319,6 +569,14 @@ test('public deep-run tool defaults to through_latest and requires opt-in exact 
   assert.equal(registration.schema.to.parse(undefined), undefined);
   assert.throws(() => registration.schema.end_policy.parse('compare_dates'));
   assert.match(registration.description, /START-DATE-ONLY/);
+});
+
+test('chart_manage_indicator exposes only the built-in study route', () => {
+  let registration = null;
+  registerChartTools({ tool: (name, description, schema) => { if (name === 'chart_manage_indicator') registration = { description, schema }; } });
+  assert.match(registration.description, /built-in/i);
+  assert.equal(registration.schema.source.parse(undefined), 'built_in');
+  assert.throws(() => registration.schema.source.parse('my_scripts'));
 });
 
 test('deep polling accepts only the armed TradingView end convention, not an arbitrary nominal end', async () => {

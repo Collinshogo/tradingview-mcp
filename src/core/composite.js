@@ -84,6 +84,152 @@ export function compactVerifiedInputs(wanted, readback) {
   return verified;
 }
 
+// Keep the strategy scan in one place.  A failed page-side read is NOT an
+// empty chart: callers must fail closed rather than add over an unknown study.
+const READ_STRATEGIES_JS = `
+  (function() {
+    function fail(index, stage, error) {
+      return { ok: false, source_index: index, stage: stage, error: error && error.message ? error.message : String(error), strategies: [] };
+    }
+    function text(v) { return (typeof v === 'string' || typeof v === 'number') ? String(v) : ''; }
+    function first(obj, properties, methods) {
+      for (var n = 0; n < properties.length; n++) {
+        try {
+          var value = text(obj && obj[properties[n]]);
+          if (value) return value;
+        } catch (e) { throw e; }
+      }
+      for (var m = 0; m < methods.length; m++) {
+        try {
+          var method = obj && obj[methods[m]];
+          var methodValue = typeof method === 'function' ? text(method.call(obj)) : '';
+          if (methodValue) return methodValue;
+        } catch (e) { throw e; }
+      }
+      return '';
+    }
+    try {
+      var cw = window.TradingViewApi._activeChartWidgetWV.value();
+      var sources = cw._chartWidget.model().model().dataSources();
+      var out = [];
+      for (var i = 0; i < sources.length; i++) {
+        try {
+          var s = sources[i];
+          var mi = typeof s.metaInfo === 'function' ? s.metaInfo() : null;
+          var isStrat = mi && (mi.isTVScriptStrategy || mi.is_strategy) && typeof s.reportData === 'function';
+          if (!isStrat) continue;
+          // Identity reads are intentionally best-effort, but a read failure is
+          // preserved on the strategy record so it cannot be mistaken for a
+          // verifiable identity or silently removed from the count.
+          var identityError = null, pineScriptId = '', pineUserId = '';
+          try {
+            pineScriptId = first(mi, ['scriptIdPart', 'scriptId', 'script_id', 'pineId', 'pine_id'], ['getScriptIdPart', 'getScriptId', 'getPineId'])
+              || first(s, ['scriptIdPart', 'scriptId', 'script_id', 'pineId', 'pine_id'], ['getScriptIdPart', 'getScriptId', 'getPineId']);
+            pineUserId = first(mi, ['userId', 'user_id', 'pineUserId'], ['getUserId', 'getPineUserId'])
+              || first(s, ['userId', 'user_id', 'pineUserId'], ['getUserId', 'getPineUserId']);
+          } catch (identityReadError) { identityError = identityReadError && identityReadError.message ? identityReadError.message : String(identityReadError); }
+          out.push({
+            id: s.id(),
+            description: text(mi.description),
+            short_description: text(mi.shortDescription),
+            title: first(mi, ['title', 'scriptTitle'], []),
+            short_title: first(mi, ['shortTitle', 'short_title'], []),
+            pine_script_id: pineScriptId,
+            pine_user_id: pineUserId,
+            identity_error: identityError,
+          });
+        } catch (sourceError) { return fail(i, 'strategy_source_extract', sourceError); }
+      }
+      return { ok: true, strategies: out };
+    } catch (e) { return fail(null, 'strategy_scan', e); }
+  })()
+`;
+
+export function buildReadStrategiesJS() { return READ_STRATEGIES_JS; }
+
+function normalizeStrategySnapshot(result) {
+  // Array support is deliberate for the existing offline test harnesses.
+  if (Array.isArray(result)) return { ok: true, strategies: result };
+  if (result && result.ok === true && Array.isArray(result.strategies)) return result;
+  return { ok: false, error: result?.error || 'strategy study scan was unreadable', strategies: [] };
+}
+
+const normalizeStrategyIdentity = (value) => String(value || '')
+  .replace(/[‒-―−]/g, '-')
+  .replace(/\s+/g, ' ')
+  .trim()
+  .toLowerCase();
+
+export function matchAttachedStrategy(strategy, { scriptName, expectedTarget } = {}) {
+  const wantedNames = [
+    scriptName,
+    expectedTarget?.name,
+    expectedTarget?.script_name,
+    expectedTarget?.title,
+    expectedTarget?.script_title,
+    expectedTarget?.editor_title,
+  ].map(normalizeStrategyIdentity).filter(Boolean);
+  const observedNames = [
+    strategy?.description,
+    strategy?.short_description,
+    strategy?.title,
+    strategy?.short_title,
+  ].map(normalizeStrategyIdentity).filter(Boolean);
+  const nameMatch = wantedNames.some((wanted) => observedNames.includes(wanted));
+  const wantedIds = [
+    expectedTarget?.script_id,
+    expectedTarget?.scriptIdPart,
+    expectedTarget?.script_id_part,
+    expectedTarget?.pine_script_id,
+  ].map(normalizeStrategyIdentity).filter(Boolean);
+  const observedIds = [strategy?.pine_script_id, strategy?.script_id, strategy?.scriptIdPart]
+    .map(normalizeStrategyIdentity).filter(Boolean);
+  const idAvailable = wantedIds.length > 0 && observedIds.length > 0;
+  const idMatch = idAvailable && observedIds.some((id) => wantedIds.includes(id));
+  // Titles are diagnostic only: saved scripts may share one. A stable script
+  // ID is required for attach authority; otherwise deepRun must fail closed.
+  return {
+    ok: idMatch,
+    name_match: nameMatch,
+    id_match: idMatch,
+    reason: !observedIds.length || !wantedIds.length ? 'identity_unverifiable' : idMatch ? null : 'identity_mismatch',
+    identity_error: strategy?.identity_error || undefined,
+  };
+}
+
+/** Require two consecutive empty strategy scans before authorizing an add. */
+export async function waitForNoStrategyStudies({
+  evaluateFn = evaluate,
+  delayFn = delay,
+  timeoutMs = 15000,
+} = {}) {
+  const deadline = Date.now() + Math.max(1, Number(timeoutMs) || 15000);
+  let last = [];
+  let lastError = null;
+  let zeroStreak = 0;
+  while (Date.now() < deadline) {
+    let snapshot;
+    try {
+      snapshot = normalizeStrategySnapshot(await evaluateFn(buildReadStrategiesJS(), {
+        timeoutMs: Math.max(1, deadline - Date.now()),
+      }));
+    } catch (error) {
+      snapshot = { ok: false, error: error?.message || String(error), strategies: [] };
+    }
+    if (snapshot.ok) {
+      last = snapshot.strategies;
+      lastError = null;
+      zeroStreak = last.length === 0 ? zeroStreak + 1 : 0;
+      if (zeroStreak >= 2) return { ok: true, strategies: [], zero_snapshots: zeroStreak };
+    } else {
+      lastError = snapshot.error;
+      zeroStreak = 0;
+    }
+    await delayFn(Math.min(500, Math.max(1, deadline - Date.now())));
+  }
+  return { ok: false, reason: lastError ? 'unreadable' : 'timeout', error: lastError || undefined, strategies: last, zero_snapshots: zeroStreak };
+}
+
 /**
  * Wait for TradingView to finish compiling and attach the strategy clicked in
  * the Pine editor. Large chassis scripts can take tens of seconds to compile;
@@ -92,48 +238,79 @@ export function compactVerifiedInputs(wanted, readback) {
  */
 export async function waitForAttachedStrategy({
   scriptName,
+  expectedTarget,
+  forbiddenEntityIds = [],
   evaluateFn = evaluate,
   delayFn = delay,
   timeoutMs = 90000,
 } = {}) {
   const deadline = Date.now() + Math.max(1, Number(timeoutMs) || 90000);
   let last = [];
+  let lastReason = 'timeout';
+  let lastStrategy = null;
+  let lastIdentity = null;
+  let lastError = null;
+  const forbidden = new Set((forbiddenEntityIds || []).map(String));
   while (Date.now() < deadline) {
-    last = await evaluateFn(
-      '(function() {' +
-      '  try {' +
-      '    var cw = window.TradingViewApi._activeChartWidgetWV.value();' +
-      '    var sources = cw._chartWidget.model().model().dataSources();' +
-      '    var out = [];' +
-      '    for (var i = 0; i < sources.length; i++) {' +
-      '      var s = sources[i], mi = null;' +
-      '      try { mi = typeof s.metaInfo === "function" ? s.metaInfo() : null; } catch (e) {}' +
-      '      if (mi && (mi.isTVScriptStrategy || mi.is_strategy) && typeof s.reportData === "function") {' +
-      '        try { out.push({ id: s.id(), description: mi.description || "", short_description: mi.shortDescription || "" }); } catch (e) {}' +
-      '      }' +
-      '    }' +
-      '    return out;' +
-      '  } catch (e) { return []; }' +
-      '})()', { timeoutMs: Math.max(1, deadline - Date.now()) },
-    ) || [];
+    let snapshot;
+    try {
+      snapshot = normalizeStrategySnapshot(await evaluateFn(buildReadStrategiesJS(), {
+        timeoutMs: Math.max(1, deadline - Date.now()),
+      }));
+    } catch (error) {
+      snapshot = { ok: false, error: error?.message || String(error), strategies: [] };
+    }
+    if (!snapshot.ok) {
+      lastReason = 'unreadable';
+      lastError = snapshot.error;
+      await delayFn(Math.min(500, Math.max(1, deadline - Date.now())));
+      continue;
+    }
+    last = snapshot.strategies || [];
     if (last.length === 1) {
       const only = last[0];
-      const norm = (s) => (s || '').replace(/[‒-―−]/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
-      const want = norm(scriptName);
-      const observed = [only.description, only.short_description].map(norm).filter(Boolean);
+      const matched = matchAttachedStrategy(only, { scriptName, expectedTarget });
+      if (!matched.ok) {
+        lastReason = matched.reason || 'identity_mismatch';
+        lastStrategy = only;
+        lastIdentity = matched;
+        lastError = matched.identity_error || null;
+        await delayFn(Math.min(500, Math.max(1, deadline - Date.now())));
+        continue;
+      }
+      if (forbidden.has(String(only.id))) {
+        lastReason = 'stale_entity';
+        lastStrategy = only;
+        lastIdentity = matched;
+        lastError = 'attached strategy reused a removed entity ID';
+        await delayFn(Math.min(500, Math.max(1, deadline - Date.now())));
+        continue;
+      }
       return {
         ok: true,
         entity_id: only.id,
         strategy: only,
-        name_match: observed.some((name) => name === want || name.includes(want) || want.includes(name)),
+        ...matched,
       };
     }
     if (last.length > 1) {
       return { ok: false, reason: 'ambiguous', strategies: last };
     }
+    lastReason = 'blank';
+    lastStrategy = null;
+    lastIdentity = null;
+    lastError = null;
     await delayFn(Math.min(500, Math.max(1, deadline - Date.now())));
   }
-  return { ok: false, reason: 'timeout', strategies: last };
+  return {
+    ok: false,
+    reason: lastReason,
+    error: lastError || undefined,
+    strategy: lastStrategy || undefined,
+    identity: lastIdentity || undefined,
+    ...(lastIdentity || {}),
+    strategies: last,
+  };
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -618,11 +795,11 @@ async function removeStrategyStudies() {
           var isStrat = mi && (mi.isTVScriptStrategy || mi.is_strategy) && typeof s.reportData === 'function';
           if (isStrat) { try { doomed.push({ id: s.id(), name: mi.description }); } catch (e) {} }
         }
-        var removed = [];
+        var removed = [], removedEntityIds = [];
         for (var j = 0; j < doomed.length; j++) {
-          try { cw.removeEntity(doomed[j].id); removed.push(doomed[j].name); } catch (e) {}
+          try { cw.removeEntity(doomed[j].id); removed.push(doomed[j].name); removedEntityIds.push(doomed[j].id); } catch (e) {}
         }
-        return { removed: removed };
+        return { removed: removed, removed_entity_ids: removedEntityIds };
       } catch (e) { return { error: e.message }; }
     })()
   `);
@@ -642,23 +819,56 @@ async function closeDialogIfOpen() {
   `);
 }
 
-async function clickAddToChart({ timeoutMs = 10000 } = {}) {
-  // The button re-renders around saves and reads "Update on chart" when the
-  // script is already applied. A disabled stale Update button must not count
-  // as a successful click after deepRun removes the old strategy.
+export function buildClickAddToChartJS() {
+  return `
+    (function() {
+      // Scope every fallback to the editor panel so generic chart/page add
+      // icons cannot be clicked by a saved-script attachment operation.
+      var root = document.querySelector('[data-qa-id="pine-editor"]')
+        || document.querySelector('[data-name="pine-editor"]')
+        || document.querySelector('.monaco-editor.pine-editor-monaco')?.closest('[class*="pane"], [class*="container"], [class*="wrapper"]');
+      if (!root) return { clicked: false, selector_kind: null };
+      function usable(el) { return !!el && el.offsetParent !== null && !el.disabled && el.getAttribute('aria-disabled') !== 'true'; }
+      function label(el) { return [el.textContent, el.getAttribute('title'), el.getAttribute('aria-label'), el.getAttribute('data-tooltip')].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim().toLowerCase(); }
+      function buttonFor(el) { return el && el.closest ? el.closest('button, [role="button"]') : el; }
+      var direct = root.querySelector('[data-qa-id="add-script-to-chart"], [data-qa-id="update-script-to-chart"]');
+      if (usable(direct)) { direct.click(); return { clicked: true, selector_kind: 'qa' }; }
+      var controls = root.querySelectorAll('button, [role="button"]');
+      for (var i = 0; i < controls.length; i++) {
+        if (usable(controls[i]) && /\\b(add|update)(?: script)? to chart\\b/.test(label(controls[i]))) {
+          controls[i].click(); return { clicked: true, selector_kind: 'text_title_aria' };
+        }
+      }
+      var icons = root.querySelectorAll('[data-icon], [data-name], [class*="icon"], svg');
+      for (var j = 0; j < icons.length; j++) {
+        var icon = icons[j];
+        var marker = [icon.getAttribute('data-icon'), icon.getAttribute('data-name'), icon.getAttribute('aria-label'), icon.getAttribute('title'), icon.className && icon.className.baseVal || icon.className].filter(Boolean).join(' ').toLowerCase();
+        if (!/(?:add|update)[-_ ]script[-_ ]to[-_ ]chart|\\b(?:add|update)(?: script)? to chart\\b/.test(marker)) continue;
+        var parent = buttonFor(icon);
+        if (usable(parent)) { parent.click(); return { clicked: true, selector_kind: 'icon' }; }
+      }
+      return { clicked: false, selector_kind: null };
+    })()
+  `;
+}
+
+export async function clickAddToChart({ timeoutMs = 10000, evaluateFn = evaluate, delayFn = delay } = {}) {
+  // Saved-script toolbar markup changes frequently. Prefer stable QA ids,
+  // then accessible/title labels, then an add/update icon's button parent.
+  // A disabled stale Update button must not count as a successful click.
   const deadline = Date.now() + Math.max(1, Number(timeoutMs) || 10000);
+  let lastError = null;
   while (Date.now() < deadline) {
-    const clicked = await evaluate(`
-      (function() {
-        var b = document.querySelector('[data-qa-id="add-script-to-chart"]') || document.querySelector('[data-qa-id="update-script-to-chart"]');
-        if (b && b.offsetParent !== null && !b.disabled && b.getAttribute('aria-disabled') !== 'true') { b.click(); return true; }
-        return false;
-      })()
-    `);
-    if (clicked) return true;
-    await delay(Math.min(500, Math.max(1, deadline - Date.now())));
+    let clicked = null;
+    try {
+      clicked = await evaluateFn(buildClickAddToChartJS());
+    } catch (error) {
+      lastError = error?.message || String(error);
+    }
+    if (clicked?.clicked) return clicked;
+    await delayFn(Math.min(500, Math.max(1, deadline - Date.now())));
   }
-  return false;
+  return { clicked: false, selector_kind: null, ...(lastError && { error: lastError }) };
 }
 
 // ── publishFile ─────────────────────────────────────────────────────────────
@@ -775,26 +985,46 @@ export async function deepRun({ script_name, timeframe, from, to, end_policy = '
 
   // one strategy at a time
   const cleared = await removeStrategyStudies();
+  if (cleared?.error) {
+    return { success: false, stage: 'remove', error: 'Could not request removal of existing strategy studies: ' + cleared.error };
+  }
+  const removal = await waitForNoStrategyStudies({ timeoutMs: 15000 });
+  if (!removal.ok) {
+    const detail = removal.reason === 'unreadable'
+      ? 'strategy studies could not be read after removal: ' + removal.error
+      : 'strategy studies remained after removal: ' + JSON.stringify(removal.strategies);
+    return { success: false, stage: 'remove', error: detail, cleared_strategies: cleared?.removed };
+  }
 
   // the editor must hold the script; open (verified) then add
-  await pine.openScript({ name: script_name });
+  const opened = await pine.openScript({ name: script_name });
   const added = await clickAddToChart();
-  if (!added) return { success: false, stage: 'add', error: 'Add-to-chart button not found' };
+  if (!added?.clicked) {
+    return { success: false, stage: 'add', error: 'Add-to-chart button not found' + (added?.error ? ': ' + added.error : '') };
+  }
 
-  // Locate the study we just added. Name matching alone is fragile: the chart
-  // study is named after the script's TITLE, which often differs from the saved
-  // NAME (and can carry em-dashes/odd whitespace). Since removeStrategyStudies
-  // cleared every strategy first, the strategy study now on the chart IS ours —
-  // use that as the authority, with name matching as a cross-check only.
+  // Locate the study we just added. A lone strategy is never enough evidence:
+  // require the exact saved Pine script ID from the verified editor open and
+  // reject any entity ID that belonged to the removed prior strategy set.
   const attached = await waitForAttachedStrategy({
     scriptName: script_name,
+    expectedTarget: opened,
+    forbiddenEntityIds: cleared?.removed_entity_ids,
     timeoutMs: Math.max(10000, Math.min(180000, Number(poll_seconds) * 1000 || 90000)),
   });
   const entityId = attached.ok ? attached.entity_id : null;
   if (!entityId) {
     const detail = attached.reason === 'ambiguous'
       ? 'multiple strategy studies remained: ' + JSON.stringify(attached.strategies)
-      : 'strategy compile/attach did not complete before the deadline';
+      : attached.reason === 'identity_mismatch'
+        ? 'sole strategy did not match the opened saved script Pine script ID: ' + JSON.stringify(attached.strategy)
+        : attached.reason === 'stale_entity'
+          ? 'sole strategy reused an entity ID removed before attachment: ' + JSON.stringify(attached.strategy)
+        : attached.reason === 'unreadable'
+          ? 'strategy studies could not be read during attachment: ' + attached.error
+          : attached.reason === 'identity_unverifiable'
+            ? 'sole strategy has no readable Pine script ID for exact saved-script verification: ' + JSON.stringify(attached.strategy)
+          : 'strategy compile/attach did not complete before the deadline';
     return { success: false, stage: 'attach', error: detail };
   }
   let verifiedInputs;
@@ -880,7 +1110,7 @@ export async function deepRun({ script_name, timeframe, from, to, end_policy = '
       };
     }
     if (polled.status === 'matched') {
-      return { success: true, cleared_strategies: cleared && cleared.removed, entity_id: entityId, rounds: round + 1, served_to: last.date_range.to, requested_to: to, end_policy, ...last, ...(verifiedInputs && { verified_inputs: verifiedInputs }) };
+      return { success: true, cleared_strategies: cleared && cleared.removed, add_selector_kind: added.selector_kind, entity_id: entityId, rounds: round + 1, served_to: last.date_range.to, requested_to: to, end_policy, ...last, ...(verifiedInputs && { verified_inputs: verifiedInputs }) };
     }
   }
   return { success: false, stage: 'poll', error: 'Exact-range deep report not served in time', last_range: last && last.date_range, last_set: lastSet };

@@ -37,6 +37,15 @@ function mockChart({ defaults }) {
 }
 
 describe('manageIndicator add — input application (#249)', () => {
+  it('refuses a saved-My-Scripts source before any chart mutation', async () => {
+    let evaluated = false;
+    await assert.rejects(
+      () => manageIndicator({ action: 'add', indicator: 'AFT Saved Strategy', source: 'my_scripts', _deps: { evaluate: async () => { evaluated = true; } } }),
+      /only adds built-in studies/,
+    );
+    assert.equal(evaluated, false);
+  });
+
   it('applies overrides and confirms them via read-back', async () => {
     const { _deps, state } = mockChart({ defaults: [{ id: 'length', value: 9 }, { id: 'source', value: 'close' }] });
     const r = await manageIndicator({ action: 'add', indicator: 'Moving Average Exponential', inputs: JSON.stringify({ length: 99, source: 'open' }), _deps });

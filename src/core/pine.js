@@ -69,6 +69,21 @@ const defaultDeps = {
   delay: (ms) => new Promise(r => setTimeout(r, ms)),
 };
 
+export function buildPineTabFallbackJS() {
+  return `
+    (function() {
+      var btn = document.querySelector('[aria-label="Pine"]')
+        || document.querySelector('[data-name="pine-dialog-button"]');
+      if (!btn || btn.offsetParent === null) return false;
+      var selected = btn.getAttribute('aria-selected');
+      var expanded = btn.getAttribute('aria-expanded');
+      if (selected !== 'false' && expanded !== 'false') return false;
+      btn.click();
+      return true;
+    })()
+  `;
+}
+
 // The script pine_open last switched the editor to (or the draft pine_new
 // created). pine_set_source refuses to write when the visible editor no
 // longer shows this script — writing anyway is exactly how one saved script
@@ -90,24 +105,31 @@ export async function ensurePineEditorOpen(deps = defaultDeps) {
   `);
   if (already) return true;
 
+  // Try one idempotent internal activation first.  Clicking the Pine tab right
+  // afterward can toggle the panel back closed while the first activation is
+  // still rendering, so the DOM button is a delayed fallback only.
   await deps.evaluate(`
     (function() {
       var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
-      if (!bwb) return;
-      if (typeof bwb.activateScriptEditorTab === 'function') bwb.activateScriptEditorTab();
-      else if (typeof bwb.showWidget === 'function') bwb.showWidget('pine-editor');
+      if (!bwb) return false;
+      if (typeof bwb.activateScriptEditorTab === 'function') { bwb.activateScriptEditorTab(); return true; }
+      if (typeof bwb.showWidget === 'function') { bwb.showWidget('pine-editor'); return true; }
+      return false;
     })()
   `);
 
-  await deps.evaluate(`
-    (function() {
-      var btn = document.querySelector('[aria-label="Pine"]')
-        || document.querySelector('[data-name="pine-dialog-button"]');
-      if (btn) btn.click();
-    })()
-  `);
+  for (let i = 0; i < 15; i++) {
+    await deps.delay(200);
+    const ready = await deps.evaluate(`(function() { return ${FIND_MONACO} !== null; })()`);
+    if (ready) return true;
+  }
 
-  for (let i = 0; i < 50; i++) {
+  // The internal activator can report success before rendering. Fall back only
+  // when the Pine tab explicitly says it is inactive; active or unknown state
+  // must not receive a second click that could toggle the panel closed.
+  await deps.evaluate(buildPineTabFallbackJS());
+
+  for (let i = 0; i < 35; i++) {
     await deps.delay(200);
     const ready = await deps.evaluate(`(function() { return ${FIND_MONACO} !== null; })()`);
     if (ready) return true;
@@ -763,7 +785,9 @@ export async function openScript({ name, _deps }) {
   return {
     success: true,
     name: record.scriptName || record.scriptTitle,
+    title: record.scriptTitle || null,
     script_id: record.scriptIdPart,
+    scriptIdPart: record.scriptIdPart,
     version: record.version ?? null,
     lines: lineCount ?? undefined,
     editor_title: active.editor_title,

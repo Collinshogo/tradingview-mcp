@@ -29,15 +29,16 @@ export function registerChartTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('chart_manage_indicator', 'Add or remove an indicator/study on the chart', {
+  server.tool('chart_manage_indicator', 'Request a study through TradingView\'s createStudy built-in API. `source` is explicitly built_in, but an arbitrary name cannot be pre-verified against My Scripts; use strategy_deep_run for saved strategies.', {
     action: z.enum(['add', 'remove']).describe('Action: add or remove'),
-    indicator: z.string().optional().describe('Full indicator name (required for add): "Relative Strength Index", "MACD", "Volume", "Moving Average", "Bollinger Bands", "Moving Average Exponential". Short names like RSI/EMA do NOT work. Not needed for remove.'),
+    indicator: z.string().optional().describe('Full built-in study name (required for add): "Relative Strength Index", "MACD", "Volume", "Moving Average", "Bollinger Bands", "Moving Average Exponential". Short names like RSI/EMA do NOT work. An arbitrary name is not pre-verified against My Scripts; use strategy_deep_run for saved strategies.'),
     entity_id: z.string().optional().describe('Entity ID (from chart_get_state). Required for remove.'),
     inputs: z.string().optional().describe('JSON string of input overrides for the indicator (e.g., \'{"length": 20}\')'),
-  }, async ({ action, indicator, entity_id, inputs }) => {
+    source: z.literal('built_in').default('built_in').describe('Explicit built-in API route only. This declares the route; it does not prove an arbitrary name is not saved.'),
+  }, async ({ action, indicator, entity_id, inputs, source }) => {
     try {
       if (action === 'add' && !indicator) throw new Error('indicator name is required for add action.');
-      return jsonResult(await core.manageIndicator({ action, indicator, entity_id, inputs }));
+      return jsonResult(await core.manageIndicator({ action, indicator, entity_id, inputs, source }));
     } catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 

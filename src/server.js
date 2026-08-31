@@ -115,7 +115,8 @@ Reading custom Pine indicator output (line.new/label.new/table.new/box.new drawi
 
 Changing the chart:
 - chart_set_symbol, chart_set_timeframe, chart_set_type → change ticker/resolution/style
-- chart_manage_indicator → add/remove studies. USE FULL NAMES: "Relative Strength Index" not "RSI"
+- chart_manage_indicator → request a study via TradingView's createStudy built-in API. USE FULL NAMES: "Relative Strength Index" not "RSI"; source is explicit but arbitrary names are not pre-verified against My Scripts.
+- strategy_deep_run → saved-strategy route: remove + verify two stable empty scans, verified editor open, Add to chart, then exact Pine-ID/new-entity verification before Deep Backtest.
 - chart_scroll_to_date → jump to a date (ISO format)
 - indicator_set_inputs → change indicator settings (length, source, etc.)
 

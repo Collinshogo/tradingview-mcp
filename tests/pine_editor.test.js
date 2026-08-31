@@ -19,10 +19,13 @@
  */
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { runInNewContext } from 'node:vm';
 import {
   openScript,
   newScript,
   setSource,
+  ensurePineEditorOpen,
+  buildPineTabFallbackJS,
   pickScriptRecord,
   _resetEditorTargetState,
 } from '../src/core/pine.js';
@@ -111,6 +114,8 @@ describe('openScript — really switches the editor', () => {
     assert.equal(res.success, true);
     assert.equal(res.verified, true);
     assert.equal(res.script_id, SCRIPT_B.scriptIdPart);
+    assert.equal(res.scriptIdPart, SCRIPT_B.scriptIdPart);
+    assert.equal(res.title, SCRIPT_B.scriptTitle);
     assert.equal(res.editor_title, SCRIPT_B.scriptName);
     assert.equal(state.openCalls.length, 1);
     assert.ok(state.openCalls[0].includes(SCRIPT_B.scriptIdPart), 'facade must receive the target record');
@@ -133,6 +138,70 @@ describe('openScript — really switches the editor', () => {
   it('surfaces a page-side facade error', async () => {
     const { deps } = mockDeps({ scripts: [SCRIPT_A], openResult: { error: 'Pine editor facade not found — is the Pine Editor open and its script-title button visible?' } });
     await assert.rejects(() => openScript({ name: 'AFT A1 Cascade', _deps: deps }), /facade not found/);
+  });
+});
+
+describe('ensurePineEditorOpen — single activation path', () => {
+  it('does not click the Pine tab after the internal activator starts rendering it', async () => {
+    let monacoReads = 0;
+    let internalActivations = 0;
+    let fallbackClicks = 0;
+    const opened = await ensurePineEditorOpen({
+      delay: async () => {},
+      evaluate: async (expr) => {
+        if (expr.includes('activateScriptEditorTab')) { internalActivations++; return true; }
+        if (expr.includes('aria-selected')) { fallbackClicks++; return true; }
+        if (expr.includes('findMonacoEditor')) return ++monacoReads > 1;
+        return null;
+      },
+    });
+    assert.equal(opened, true);
+    assert.equal(internalActivations, 1);
+    assert.equal(fallbackClicks, 0);
+  });
+
+  it('uses one DOM fallback only when no internal Pine editor activator exists', async () => {
+    let fallbackClicks = 0;
+    let clicked = false;
+    const opened = await ensurePineEditorOpen({
+      delay: async () => {},
+      evaluate: async (expr) => {
+        if (expr.includes('activateScriptEditorTab')) return false;
+        if (expr.includes('aria-selected')) { fallbackClicks++; clicked = true; return true; }
+        if (expr.includes('findMonacoEditor')) return clicked;
+        return null;
+      },
+    });
+    assert.equal(opened, true);
+    assert.equal(fallbackClicks, 1);
+  });
+
+  it('falls back after an internal activation reports success but never renders Monaco', async () => {
+    let fallbackClicks = 0;
+    let clicked = false;
+    const opened = await ensurePineEditorOpen({
+      delay: async () => {},
+      evaluate: async (expr) => {
+        if (expr.includes('activateScriptEditorTab')) return true;
+        if (expr.includes('aria-selected')) { fallbackClicks++; clicked = true; return true; }
+        if (expr.includes('findMonacoEditor')) return clicked;
+        return null;
+      },
+    });
+    assert.equal(opened, true);
+    assert.equal(fallbackClicks, 1);
+  });
+
+  it('DOM fallback clicks only an explicitly inactive Pine tab', () => {
+    const run = (attrs) => {
+      let clicks = 0;
+      const button = { offsetParent: {}, getAttribute: (name) => attrs[name] || null, click: () => { clicks++; } };
+      const result = runInNewContext(buildPineTabFallbackJS(), { document: { querySelector: () => button } });
+      return { result, clicks };
+    };
+    assert.deepEqual(run({ 'aria-selected': 'false' }), { result: true, clicks: 1 });
+    assert.deepEqual(run({ 'aria-selected': 'true' }), { result: false, clicks: 0 });
+    assert.deepEqual(run({}), { result: false, clicks: 0 });
   });
 });
 
