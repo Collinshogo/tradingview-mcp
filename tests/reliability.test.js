@@ -101,6 +101,30 @@ test('a replaced local token loses re-entrant ownership and cannot continue', as
   await rm(dir, { recursive: true, force: true });
 });
 
+test('same-process heartbeat and re-entrant acquisitions serialize lease writes', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tv-mcp-reentrant-write-'));
+  const lockPath = join(dir, 'lease.json');
+  const first = await acquireLease({ lockPath, busyMs: 50, heartbeatMs: 1 });
+  try {
+    // A burst of re-entrant writes reproduces the deterministic same-token
+    // temp collision while the 1 ms heartbeat is also active.
+    const nested = await Promise.all(Array.from({ length: 24 }, (_, index) => acquireLease({
+      lockPath, busyMs: 50, heartbeatMs: 1,
+      operation: `reentrant-${index}`, tool: `reentrant-${index}`,
+    })));
+    const owner = JSON.parse(await readFile(lockPath, 'utf8'));
+    assert.equal(owner.token, first.token);
+    assert.equal(owner.operation, 'reentrant-23');
+    assert.equal(owner.tool, 'reentrant-23');
+    assert.ok(Number.isFinite(Date.parse(owner.heartbeat)));
+    assert.ok(nested.every(handle => handle.token === first.token));
+    await Promise.all(nested.map(handle => handle.release()));
+  } finally {
+    await first.release();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('withLease always releases its token', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'tv-mcp-with-'));
   const lockPath = join(dir, 'lease.json');

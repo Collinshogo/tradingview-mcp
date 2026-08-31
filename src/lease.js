@@ -29,6 +29,7 @@ export class LeaseBusyError extends Error {
 }
 
 let localLease = null;
+const leaseWriteChains = new Map();
 
 function token() { return randomBytes(24).toString('hex'); }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
@@ -124,8 +125,12 @@ async function reclaimStale(path, owner, staleMs = DEFAULT_STALE_MS, expectedTok
   } catch { return false; }
 }
 
-async function writeLease(path, value) {
-  const tmp = `${path}.${value.token}.tmp`;
+async function writeLeaseFile(path, value) {
+  const currentBeforeWrite = await readLease(path);
+  if (!currentBeforeWrite || currentBeforeWrite.token !== value.token) {
+    throw new Error('Lease token changed during heartbeat');
+  }
+  const tmp = `${path}.${value.token}.${token()}.tmp`;
   try {
     await fs.writeFile(tmp, JSON.stringify(value), { encoding: 'utf8', flag: 'wx' });
     try {
@@ -146,28 +151,41 @@ async function writeLease(path, value) {
   }
 }
 
+async function writeLease(path, value) {
+  // Heartbeats and re-entrant acquisitions share one process-local owner and
+  // can reach this function concurrently. Serialize each lease path so their
+  // Windows truncate/write fallback cannot interleave, and snapshot the owner
+  // so a later heartbeat cannot mutate a queued write.
+  const snapshot = typeof value === 'function' ? null : { ...value };
+  const resolveValue = typeof value === 'function' ? value : () => snapshot;
+  const previous = leaseWriteChains.get(path) || Promise.resolve();
+  const pending = previous.catch(() => {}).then(() => writeLeaseFile(path, resolveValue()));
+  leaseWriteChains.set(path, pending);
+  try {
+    await pending;
+  } finally {
+    if (leaseWriteChains.get(path) === pending) leaseWriteChains.delete(path);
+  }
+}
+
 /** Acquire the process-wide lease, waiting only up to busyMs. */
 export async function acquireLease({ operation = 'mutation', tool = operation, lockPath = LEASE_PATH,
   busyMs = DEFAULT_BUSY_MS, staleMs = DEFAULT_STALE_MS, heartbeatMs = DEFAULT_HEARTBEAT_MS } = {}) {
   if (localLease && localLease.lockPath === lockPath) {
-    const current = await readLease(lockPath);
-    if (current?.token === localLease.owner.token) {
-      const nextOwner = { ...localLease.owner, operation, tool, heartbeat: new Date().toISOString() };
-      try {
-        await writeLease(lockPath, nextOwner);
-        localLease.owner = nextOwner;
-        return makeHandle(localLease, heartbeatMs);
-      } catch (error) {
-        // A replaced/deleted lock is a lost lease, never a successful
-        // re-entrant acquisition. Drop local ownership and re-enter the
-        // guarded acquisition path below.
-        const verify = await readLease(lockPath);
-        if (verify?.token === localLease.owner.token) throw error;
-        localLease = null;
-      }
-    } else {
-      // Another process replaced or removed our token. Old handles remain
-      // token-checked and cannot release the successor.
+    const nextOwner = { ...localLease.owner, operation, tool, heartbeat: new Date().toISOString() };
+    try {
+      // writeLease serializes the token check with any in-flight heartbeat,
+      // so this cannot mistake that heartbeat's brief Windows rewrite for a
+      // replaced lease.
+      await writeLease(lockPath, nextOwner);
+      localLease.owner = nextOwner;
+      return makeHandle(localLease, heartbeatMs);
+    } catch (error) {
+      // A replaced/deleted lock is a lost lease, never a successful
+      // re-entrant acquisition. Drop local ownership and re-enter the
+      // guarded acquisition path below.
+      const verify = await readLease(lockPath);
+      if (verify?.token === localLease.owner.token) throw error;
       localLease = null;
     }
   }
@@ -205,10 +223,12 @@ function makeHandle(state, heartbeatMs) {
   if (!state.heartbeat) {
     state.heartbeat = setInterval(async () => {
       if (localLease !== state) return;
-      const current = await readLease(state.lockPath);
-      if (!current || current.token !== state.owner.token) return;
-      state.owner.heartbeat = new Date().toISOString();
-      await writeLease(state.lockPath, state.owner).catch(() => {});
+      // Resolve the owner only when this queued heartbeat reaches the disk.
+      // Re-entrant acquisitions ahead of it may have changed tool metadata;
+      // a stale snapshot must not overwrite that newer metadata.
+      await writeLease(state.lockPath, () => ({
+        ...state.owner, heartbeat: new Date().toISOString(),
+      })).catch(() => {});
     }, heartbeatMs);
     state.heartbeat.unref?.();
   }
@@ -223,6 +243,10 @@ function makeHandle(state, heartbeatMs) {
       if (state.handles) return true;
       if (state.heartbeat) clearInterval(state.heartbeat);
       state.heartbeat = null;
+      // A heartbeat callback already in progress may still own a queued
+      // write. Let it finish before the token-checked unlink so it cannot
+      // recreate or partially rewrite a released lease.
+      await leaseWriteChains.get(state.lockPath)?.catch(() => {});
       const current = await readLease(state.lockPath);
       if (!current || current.token !== state.owner.token) {
         if (localLease === state) localLease = null;
