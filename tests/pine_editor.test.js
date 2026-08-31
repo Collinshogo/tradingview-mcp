@@ -26,6 +26,7 @@ import {
   setSource,
   ensurePineEditorOpen,
   buildPineTabFallbackJS,
+  FIND_MONACO,
   fingerprintSource,
   getSourceInfo,
   pickScriptRecord,
@@ -35,6 +36,62 @@ import {
 const SCRIPT_A = { scriptIdPart: 'USER;aaa111', scriptName: 'AFT A1 Cascade', scriptTitle: 'A1', version: '3.0' };
 const SCRIPT_B = { scriptIdPart: 'USER;bbb222', scriptName: 'AFT Gap Fade', scriptTitle: 'Gap Fade', version: '7.0' };
 const DRAFT = { script_id: null, script_name: 'Untitled script', script_title: null, version: '0.0', editor_title: 'Untitled script' };
+
+describe('FIND_MONACO — current and legacy TradingView React shapes', () => {
+  function fixture({ direct }) {
+    const hiddenContainer = {
+      parentElement: null,
+      getBoundingClientRect: () => ({ width: 0, height: 0 }),
+    };
+    const visibleContainer = {
+      parentElement: null,
+      getBoundingClientRect: () => ({ width: 900, height: 700 }),
+      contains: (node) => node === visibleContainer,
+    };
+    const hiddenEditor = {
+      getDomNode: () => hiddenContainer,
+    };
+    const visibleEditor = {
+      getDomNode: () => visibleContainer,
+    };
+    const env = { editor: { getEditors: () => [hiddenEditor, visibleEditor] } };
+    visibleContainer.__reactFiber$test = {
+      memoizedProps: direct ? { monacoEnv: env } : { value: { monacoEnv: env } },
+      return: null,
+    };
+    const document = {
+      querySelectorAll: () => [hiddenContainer, visibleContainer],
+    };
+    return { document, visibleEditor, env };
+  }
+
+  it('finds the visible editor through current direct props.monacoEnv', () => {
+    const { document, visibleEditor, env } = fixture({ direct: true });
+    const result = runInNewContext(FIND_MONACO, { document });
+    assert.equal(result.editor, visibleEditor);
+    assert.equal(result.env, env);
+  });
+
+  it('retains the legacy props.value.monacoEnv path', () => {
+    const { document, visibleEditor, env } = fixture({ direct: false });
+    const result = runInNewContext(FIND_MONACO, { document });
+    assert.equal(result.editor, visibleEditor);
+    assert.equal(result.env, env);
+  });
+
+  it('fails closed when only an unrelated visible Monaco editor is exposed', () => {
+    const { document } = fixture({ direct: true });
+    const container = document.querySelectorAll()[1];
+    const unrelated = {
+      getBoundingClientRect: () => ({ width: 800, height: 600 }),
+      contains: () => false,
+    };
+    const env = { editor: { getEditors: () => [{ getDomNode: () => unrelated }] } };
+    container.__reactFiber$test = { memoizedProps: { monacoEnv: env }, return: null };
+    const result = runInNewContext(FIND_MONACO, { document });
+    assert.equal(result, null);
+  });
+});
 
 function activeOf(rec) {
   return {

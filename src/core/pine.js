@@ -7,13 +7,18 @@ import { evaluate, evaluateAsync, getClient, withDeadline, DEFAULT_DEADLINE_MS }
 import { createHash } from 'node:crypto';
 
 // ── Monaco finder (injected into TV page) ──
-const FIND_MONACO = `
+export const FIND_MONACO = `
   (function findMonacoEditor() {
-    var container = document.querySelector('.monaco-editor.pine-editor-monaco');
+    var containers = document.querySelectorAll('.monaco-editor.pine-editor-monaco');
+    var container = null;
+    for (var c = 0; c < containers.length; c++) {
+      var rect = containers[c].getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) { container = containers[c]; break; }
+    }
     if (!container) return null;
     var el = container;
     var fiberKey;
-    for (var i = 0; i < 20; i++) {
+    for (var i = 0; i < 30; i++) {
       if (!el) break;
       fiberKey = Object.keys(el).find(function(k) { return k.startsWith('__reactFiber$'); });
       if (fiberKey) break;
@@ -21,13 +26,25 @@ const FIND_MONACO = `
     }
     if (!fiberKey) return null;
     var current = el[fiberKey];
-    for (var d = 0; d < 15; d++) {
+    for (var d = 0; d < 40; d++) {
       if (!current) break;
-      if (current.memoizedProps && current.memoizedProps.value && current.memoizedProps.value.monacoEnv) {
-        var env = current.memoizedProps.value.monacoEnv;
+      var props = current.memoizedProps;
+      var env = props && (
+        props.monacoEnv
+        || (props.value && props.value.monacoEnv)
+      );
+      if (env) {
         if (env.editor && typeof env.editor.getEditors === 'function') {
           var editors = env.editor.getEditors();
-          if (editors.length > 0) return { editor: editors[0], env: env };
+          for (var e = 0; e < editors.length; e++) {
+            var node = typeof editors[e].getDomNode === 'function' ? editors[e].getDomNode() : null;
+            if (!node) continue;
+            var nodeRect = node.getBoundingClientRect();
+            if (!nodeRect.width || !nodeRect.height) continue;
+            if (node === container || container.contains(node) || node.contains(container)) {
+              return { editor: editors[e], env: env };
+            }
+          }
         }
       }
       current = current.return;
