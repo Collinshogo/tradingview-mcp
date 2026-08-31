@@ -47,6 +47,58 @@ export async function waitForStudyInputs({ entityId, evaluateFn = evaluate, dela
   return { ok: false, length: 0 };
 }
 
+/**
+ * Wait for TradingView to finish compiling and attach the strategy clicked in
+ * the Pine editor. Large chassis scripts can take tens of seconds to compile;
+ * a fixed post-click sleep creates a false "study not found" failure while the
+ * compile is still running. Fail closed if more than one strategy remains.
+ */
+export async function waitForAttachedStrategy({
+  scriptName,
+  evaluateFn = evaluate,
+  delayFn = delay,
+  timeoutMs = 90000,
+} = {}) {
+  const deadline = Date.now() + Math.max(1, Number(timeoutMs) || 90000);
+  let last = [];
+  while (Date.now() < deadline) {
+    last = await evaluateFn(
+      '(function() {' +
+      '  try {' +
+      '    var cw = window.TradingViewApi._activeChartWidgetWV.value();' +
+      '    var sources = cw._chartWidget.model().model().dataSources();' +
+      '    var out = [];' +
+      '    for (var i = 0; i < sources.length; i++) {' +
+      '      var s = sources[i], mi = null;' +
+      '      try { mi = typeof s.metaInfo === "function" ? s.metaInfo() : null; } catch (e) {}' +
+      '      if (mi && (mi.isTVScriptStrategy || mi.is_strategy) && typeof s.reportData === "function") {' +
+      '        try { out.push({ id: s.id(), description: mi.description || "", short_description: mi.shortDescription || "" }); } catch (e) {}' +
+      '      }' +
+      '    }' +
+      '    return out;' +
+      '  } catch (e) { return []; }' +
+      '})()', { timeoutMs: Math.max(1, deadline - Date.now()) },
+    ) || [];
+    if (last.length === 1) {
+      const only = last[0];
+      const norm = (s) => (s || '').replace(/[‒-―−]/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
+      const want = norm(scriptName);
+      const observed = [only.description, only.short_description].map(norm).filter(Boolean);
+      return {
+        ok: true,
+        entity_id: only.id,
+        strategy: only,
+        name_match: observed.some((name) => name === want || name.includes(want) || want.includes(name)),
+      };
+    }
+    if (last.length > 1) {
+      return { ok: false, reason: 'ambiguous', strategies: last };
+    }
+    await delayFn(Math.min(500, Math.max(1, deadline - Date.now())));
+  }
+  return { ok: false, reason: 'timeout', strategies: last };
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 async function clickTesterChip() {
@@ -353,19 +405,21 @@ async function closeDialogIfOpen() {
   `);
 }
 
-async function clickAddToChart() {
+async function clickAddToChart({ timeoutMs = 10000 } = {}) {
   // The button re-renders around saves and reads "Update on chart" when the
-  // script is already applied — retry briefly and accept either form.
-  for (let attempt = 0; attempt < 4; attempt++) {
+  // script is already applied. A disabled stale Update button must not count
+  // as a successful click after deepRun removes the old strategy.
+  const deadline = Date.now() + Math.max(1, Number(timeoutMs) || 10000);
+  while (Date.now() < deadline) {
     const clicked = await evaluate(`
       (function() {
         var b = document.querySelector('[data-qa-id="add-script-to-chart"]') || document.querySelector('[data-qa-id="update-script-to-chart"]');
-        if (b && b.offsetParent !== null) { b.click(); return true; }
+        if (b && b.offsetParent !== null && !b.disabled && b.getAttribute('aria-disabled') !== 'true') { b.click(); return true; }
         return false;
       })()
     `);
     if (clicked) return true;
-    await delay(800);
+    await delay(Math.min(500, Math.max(1, deadline - Date.now())));
   }
   return false;
 }
@@ -480,42 +534,24 @@ export async function deepRun({ script_name, timeframe, from, to, inputs, poll_s
   await pine.openScript({ name: script_name });
   const added = await clickAddToChart();
   if (!added) return { success: false, stage: 'add', error: 'Add-to-chart button not found' };
-  await delay(2500);
 
   // Locate the study we just added. Name matching alone is fragile: the chart
   // study is named after the script's TITLE, which often differs from the saved
   // NAME (and can carry em-dashes/odd whitespace). Since removeStrategyStudies
   // cleared every strategy first, the strategy study now on the chart IS ours —
   // use that as the authority, with name matching as a cross-check only.
-  const norm = (s) => (s || '').replace(/[‒-―−]/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
-  let entityId = await evaluate(`
-    (function() {
-      try {
-        var cw = window.TradingViewApi._activeChartWidgetWV.value();
-        var sources = cw._chartWidget.model().model().dataSources();
-        var ids = [];
-        for (var i = 0; i < sources.length; i++) {
-          var s = sources[i], mi = null;
-          try { mi = s.metaInfo ? s.metaInfo() : null; } catch (e) {}
-          if (mi && (mi.isTVScriptStrategy || mi.is_strategy) && typeof s.reportData === 'function') {
-            try { ids.push(s.id()); } catch (e) {}
-          }
-        }
-        return ids.length === 1 ? ids[0] : null;
-      } catch (e) { return null; }
-    })()
-  `);
+  const attached = await waitForAttachedStrategy({
+    scriptName: script_name,
+    timeoutMs: Math.max(10000, Math.min(180000, Number(poll_seconds) * 1000 || 90000)),
+  });
+  const entityId = attached.ok ? attached.entity_id : null;
   if (!entityId) {
-    const state = await chart.getState();
-    if (state && state.studies) {
-      const want = norm(script_name);
-      const strat = state.studies.find((s) => norm(s.name) === want)
-        || state.studies.find((s) => norm(s.name).includes(want) || want.includes(norm(s.name)));
-      entityId = strat && strat.id;
-    }
+    const detail = attached.reason === 'ambiguous'
+      ? 'multiple strategy studies remained: ' + JSON.stringify(attached.strategies)
+      : 'strategy compile/attach did not complete before the deadline';
+    return { success: false, stage: 'attach', error: detail };
   }
   if (inputs) {
-    if (!entityId) return { success: false, stage: 'inputs', error: 'study "' + script_name + '" not found on chart for input overrides' };
     const wanted = typeof inputs === 'string' ? JSON.parse(inputs) : inputs;
     // The freshly-added study can still be compiling; avoid writing an empty
     // input snapshot, which silently no-ops or wedges the study.

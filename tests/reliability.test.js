@@ -12,7 +12,7 @@ import {
   acquireLease, withLease, runExclusive, isLeaseBusy,
 } from '../src/lease.js';
 import { runtimeIdentity } from '../src/core/health.js';
-import { waitForStudyInputs } from '../src/core/composite.js';
+import { waitForAttachedStrategy, waitForStudyInputs } from '../src/core/composite.js';
 
 test('withDeadline rejects a never-resolving operation with stage and timeout', async () => {
   await assert.rejects(
@@ -153,6 +153,50 @@ test('empty study readiness fails closed before any input write can occur', asyn
   assert.equal(ready.ok, false);
   assert.ok(evaluations > 0);
   // deepRun only calls setInputs after waitForStudyInputs().ok is true.
+});
+
+test('slow Pine compile is polled until one attached strategy appears', async () => {
+  let evaluations = 0;
+  const attached = await waitForAttachedStrategy({
+    scriptName: 'MYM Session ORB Chassis', timeoutMs: 100,
+    evaluateFn: async () => {
+      evaluations++;
+      return evaluations < 4 ? [] : [{
+        id: 'strategy-1',
+        description: 'MYM Session ORB Chassis',
+        short_description: 'MYM-ORB',
+      }];
+    },
+    delayFn: async () => {},
+  });
+  assert.equal(attached.ok, true);
+  assert.equal(attached.entity_id, 'strategy-1');
+  assert.equal(attached.name_match, true);
+  assert.equal(evaluations, 4);
+});
+
+test('multiple attached strategies fail closed as ambiguous', async () => {
+  const attached = await waitForAttachedStrategy({
+    scriptName: 'MYM Session ORB Chassis', timeoutMs: 100,
+    evaluateFn: async () => [
+      { id: 'strategy-1', description: 'MYM Session ORB Chassis' },
+      { id: 'strategy-2', description: 'Other Strategy' },
+    ],
+    delayFn: async () => {},
+  });
+  assert.equal(attached.ok, false);
+  assert.equal(attached.reason, 'ambiguous');
+  assert.equal(attached.strategies.length, 2);
+});
+
+test('missing attached strategy times out fail-closed', async () => {
+  const attached = await waitForAttachedStrategy({
+    scriptName: 'MYM Session ORB Chassis', timeoutMs: 5,
+    evaluateFn: async () => [],
+    delayFn: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  });
+  assert.equal(attached.ok, false);
+  assert.equal(attached.reason, 'timeout');
 });
 
 test('exclusive process mode protects direct connection imports until owner exit', async () => {
