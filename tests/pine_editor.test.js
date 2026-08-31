@@ -171,7 +171,38 @@ describe('fingerprintSource', () => {
   it('caps build markers at twenty', () => {
     const result = fingerprintSource(Array.from({ length: 25 }, (_, i) => `// build ${i}`).join('\n'));
     assert.equal(result.build_markers.length, 20);
-    assert.equal(result.build_markers[19].line, 20);
+    assert.equal(result.build_markers[0].line, 1);
+    assert.equal(result.build_markers[9].line, 10);
+    assert.equal(result.build_markers[10].line, 16);
+    assert.equal(result.build_markers[19].line, 25);
+  });
+
+  it('preserves a late literal telemetry plot after crowded build comments', () => {
+    const source = [
+      ...Array.from({ length: 25 }, (_, i) => `// build ${i}`),
+      'plot(1, "b", display = display.data_window) // build stamp',
+    ].join('\n');
+    const result = fingerprintSource(source);
+    assert.equal(result.build_markers.length, 20);
+    assert.equal(result.build_markers[0].line, 1);
+    assert.deepEqual(result.build_markers.at(-1), {
+      line: 26,
+      text: 'plot(1, "b", display = display.data_window) // build stamp',
+    });
+  });
+
+  it('ignores commented and wrong-case plot decoys around the real b telemetry', () => {
+    const source = [
+      ...Array.from({ length: 11 }, () => 'plot(1, "B", display = display.data_window)'),
+      'plot(1, "b", display = display.data_window)',
+      ...Array.from({ length: 11 }, () => 'plot(2, "B", display = display.data_window)'),
+      '// plot(3, "b", display = display.data_window)',
+    ].join('\n');
+    const result = fingerprintSource(source);
+    assert.deepEqual(result.build_markers, [{
+      line: 12,
+      text: 'plot(1, "b", display = display.data_window)',
+    }]);
   });
 });
 

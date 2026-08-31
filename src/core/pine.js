@@ -188,17 +188,41 @@ export function fingerprintSource(source) {
 
   const normalized = source.replace(/\r\n|\r/g, '\n');
   const hash = (value) => createHash('sha256').update(Buffer.from(value, 'utf8')).digest('hex');
-  const markerMatches = [];
+  const buildCandidates = [];
+  const telemetryCandidates = [];
   const lines = normalized.split('\n');
   // Match editor/file line-number conventions: a terminal newline terminates
   // the last content line; it does not create a phantom extra blank line.
   const lineCount = normalized === '' ? 0 : lines.length - (normalized.endsWith('\n') ? 1 : 0);
-  for (let index = 0; index < lines.length && markerMatches.length < 20; index++) {
+  for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
-    if (/\bbuild\s+\d+\b/i.test(line) || /\bb\s*=\s*\d+\b/i.test(line)) {
-      markerMatches.push({ line: index + 1, text: line.slice(0, 240) });
-    }
+    const marker = { line: index + 1, text: line.slice(0, 240) };
+    const isTelemetry = /\bb\s*=\s*\d+\b/i.test(line)
+      || /^\s*plot\s*\(\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*,\s*"b"\s*(?:,|\))/.test(line);
+    if (isTelemetry) telemetryCandidates.push(marker);
+    else if (/\bbuild\s+\d+\b/i.test(line)) buildCandidates.push(marker);
   }
+
+  // Keep the compact response bounded without allowing numerous provenance
+  // comments near the header to crowd out a late data-window `b` plot.
+  let buildLimit = Math.min(buildCandidates.length, 10);
+  let telemetryLimit = Math.min(telemetryCandidates.length, 10);
+  let remaining = 20 - buildLimit - telemetryLimit;
+  const extraBuilds = Math.min(remaining, buildCandidates.length - buildLimit);
+  buildLimit += extraBuilds;
+  remaining -= extraBuilds;
+  telemetryLimit += Math.min(remaining, telemetryCandidates.length - telemetryLimit);
+  const boundedEnds = (items, limit) => {
+    if (limit <= 0) return [];
+    if (items.length <= limit) return items;
+    const head = Math.ceil(limit / 2);
+    const tail = limit - head;
+    return tail > 0 ? [...items.slice(0, head), ...items.slice(-tail)] : items.slice(0, head);
+  };
+  const markerMatches = [
+    ...boundedEnds(buildCandidates, buildLimit),
+    ...boundedEnds(telemetryCandidates, telemetryLimit),
+  ].sort((a, b) => a.line - b.line);
 
   return {
     raw_utf8_sha256: hash(source),
