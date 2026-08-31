@@ -873,8 +873,20 @@ export async function clickAddToChart({ timeoutMs = 10000, evaluateFn = evaluate
 
 // ── publishFile ─────────────────────────────────────────────────────────────
 
-export async function publishFile({ path, name }) {
-  const source = readFileSync(path, 'utf8');
+export async function publishFile({ path, name, _deps } = {}) {
+  const deps = {
+    readFileSync,
+    delay,
+    openScript: pine.openScript,
+    newScript: pine.newScript,
+    setSource: pine.setSource,
+    smartCompile: pine.smartCompile,
+    getErrors: pine.getErrors,
+    save: pine.save,
+    getSource: pine.getSource,
+    ..._deps,
+  };
+  const source = deps.readFileSync(path, 'utf8');
   const lineCount = source.split('\n').length;
   // the save-name dialog prefills from the script title — creation only lands
   // under `name` when the title matches it
@@ -886,7 +898,7 @@ export async function publishFile({ path, name }) {
   let created = false;
   let preVersion = null;
   try {
-    opened = await pine.openScript({ name });
+    opened = await deps.openScript({ name });
     preVersion = opened && opened.version;
   } catch (e) {
     // not found -> create a fresh draft (indicator/strategy inferred by TV from source on save)
@@ -894,32 +906,46 @@ export async function publishFile({ path, name }) {
       return { success: false, stage: 'precheck', error: 'script title "' + scriptTitle + '" != publish name "' + name + '" — the save dialog prefills from the title, so a new script would land under the wrong name' };
     }
     const kind = /^\s*strategy\s*\(/m.test(source) ? 'strategy' : 'indicator';
-    await pine.newScript({ type: kind });
+    await deps.newScript({ type: kind });
     created = true;
   }
 
-  await pine.setSource({ source });
-  const compiled = await pine.smartCompile();
-  if (compiled && compiled.has_errors) {
-    return { success: false, stage: 'compile', errors: compiled.errors, created };
+  await deps.setSource({ source });
+  const compiled = await deps.smartCompile();
+  const isHardCompileMarker = (marker) => {
+    const severity = marker && marker.severity;
+    if (typeof severity === 'number') return severity >= 8; // Monaco: warning=4, error=8.
+    if (typeof severity === 'string') {
+      const value = severity.trim();
+      if (/^\d+$/.test(value)) return Number(value) >= 8;
+      if (/error|fatal/i.test(value)) return true;
+      if (/warning|warn|info|hint/i.test(value)) return false;
+    }
+    // An unclassified diagnostic is not safe to publish through.
+    return true;
+  };
+  if (compiled && compiled.success === false) {
+    return { success: false, stage: 'compile', errors: compiled.errors || [compiled], created };
+  }
+  const compiledMarkers = Array.isArray(compiled && compiled.errors) ? compiled.errors : [];
+  const compiledHard = compiledMarkers.filter(isHardCompileMarker);
+  if (compiledHard.length || (compiled && compiled.has_errors && compiledMarkers.length === 0)) {
+    return { success: false, stage: 'compile', errors: compiledHard.length ? compiledHard : (compiled.errors || [compiled]), created };
   }
   // belt-and-braces: smartCompile can miss late-surfacing syntax errors (seen
   // 07-19 on LVL-5M "Syntax error at input") — query the editor's marker list
-  await delay(1200);
+  await deps.delay(1200);
   try {
-    const errs = await pine.getErrors();
+    const errs = await deps.getErrors();
     const list = Array.isArray(errs) ? errs : (errs && errs.errors) || [];
-    const hard = list.filter((e) => !e.severity || /error/i.test(String(e.severity)));
+    const hard = list.filter(isHardCompileMarker);
     if (hard.length) return { success: false, stage: 'compile', errors: hard.slice(0, 5), created };
   } catch (e) { /* marker query is best-effort */ }
-  // A NEW script needs the save-name dialog accepted. TV prefills it with the
-  // strategy()/indicator() title, so the source's title MUST equal `name` —
-  // pine.save() dispatches Ctrl+S and clicks the dialog's Save.
-  if (created) {
-    await delay(700);
-    await pine.save();
-    await delay(1500);
-  }
+  // Every successful compile must be saved before server readback. A NEW
+  // script also needs the name dialog accepted; save() handles both cases.
+  if (created) await deps.delay(700);
+  await deps.save();
+  await deps.delay(1500);
 
   // Verify the save persisted server-side (lesson 9: silent-save wedge).
   // openScript re-fetches the SERVER-saved source into the editor, but the
@@ -933,14 +959,14 @@ export async function publishFile({ path, name }) {
   let contentOk = null;
   let persisted = false;
   for (let attempt = 0; attempt < 4 && !persisted; attempt++) {
-    await delay(attempt === 0 ? 1500 : 4000);
-    try { verify = await pine.openScript({ name }); } catch (e) { continue; }
+    await deps.delay(attempt === 0 ? 1500 : 4000);
+    try { verify = await deps.openScript({ name }); } catch (e) { continue; }
     versionOk = created || !preVersion || verify.version !== preVersion;
     const linesOk = Math.abs((verify.lines || 0) - lineCount) <= 2;
     if (linesOk && versionOk) { persisted = true; break; }
     if (linesOk && !versionOk) {
       try {
-        const savedSrc = await pine.getSource();
+        const savedSrc = await deps.getSource();
         contentOk = norm(typeof savedSrc === 'string' ? savedSrc : (savedSrc && savedSrc.source) || '') === norm(source);
       } catch (e) { contentOk = false; }
       if (contentOk) { persisted = true; break; }
@@ -948,10 +974,10 @@ export async function publishFile({ path, name }) {
   }
   if (!persisted && verify && contentOk === false) {
     // genuine mismatch after polling: one retry save, one final poll
-    await pine.save();
-    await delay(3000);
+    await deps.save();
+    await deps.delay(3000);
     try {
-      verify = await pine.openScript({ name });
+      verify = await deps.openScript({ name });
       versionOk = created || !preVersion || verify.version !== preVersion;
       persisted = Math.abs((verify.lines || 0) - lineCount) <= 2 && versionOk;
     } catch (e) { /* keep prior verdict */ }
